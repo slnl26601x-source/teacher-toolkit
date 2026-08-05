@@ -13,6 +13,11 @@
   - image_only（純圖無字）→ 保留原圖，不貼文字
   - mixed（圖文混合）→ 保留原圖 + OCR 文字
 
+排版：
+  - 連續排版：不做逐頁分頁，跨頁未完句子自動接合
+  - 標題（章/節/目錄）用較大字體（16pt 黑體），正文 12pt 宋體、首行縮排
+  - 孤行頁碼自動移除；段落依空行/縮排/對白引號重整
+
 流程：
   1. 每頁抽成高解析 PNG
   2. Gemini 分析頁面類型 + OCR（快取於 _scan2docx_*/pages/*.ocr.txt）
@@ -164,12 +169,50 @@ def reflow_text(text: str) -> list:
     return [p for p in paras if p.strip()]
 
 
+def is_heading(s: str) -> bool:
+    """判斷是否為標題（章/節/目錄等）"""
+    import re
+    t = s.strip()
+    if not t:
+        return False
+    if re.match(r"^第[一二三四五六七八九十百千\d]+章", t):
+        return True
+    if re.match(r"^\d+[\.、．]\s*\S", t):
+        return True
+    norm = re.sub(r"\s", "", t)
+    if norm in {"目录", "内容提要", "后记", "作者像", "序", "前言", "题记", "空中的足音"}:
+        return True
+    return False
+
+
+def is_terminal(s: str) -> bool:
+    """是否以句末標點（或閉引號）結束"""
+    import re
+    return bool(
+        re.search(r"[。！？…\u2026」』”）)]\s*$", s)
+        or re.search(r"[.!?]\s*$", s)
+    )
+
+
 def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
                skip_ocr: bool, dpi: int = 200):
     from docx import Document
-    from docx.shared import Inches
+    from docx.shared import Inches, Pt
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml.ns import qn
 
     doc = Document()
+    style = doc.styles["Normal"]
+    style.font.name = "SimSun"
+    style.font.size = Pt(12)
+    style._element.rPr.rFonts.set(qn("w:eastAsia"), "SimSun")
+    style.paragraph_format.first_line_indent = Pt(24)
+    style.paragraph_format.space_after = Pt(6)
+
+    items = []          # ("text"|"heading", 文字) 或 ("img", 路徑)
+    prev_terminal = True   # 上一頁最後一段是否句末結束
+    prev_has_img = False
+
     for n, i in enumerate(idxs):
         png = pages_dir / f"page_{i + 1:03d}.png"
         if not png.exists():
@@ -187,17 +230,46 @@ def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
                 kind, text = ocr_page(png, model)
                 txt.write_text(f"{kind}\n{text}", encoding="utf-8")
 
-        # 純文字頁 → 不插圖
-        show_img = kind != "text_only"
-        if show_img:
-            p = doc.add_paragraph()
-            p.add_run().add_picture(str(png), width=Inches(5.0))
+        page_has_img = kind != "text_only"
+        if page_has_img:
+            items.append(("img", str(png)))
 
-        # 純圖頁 → 不貼文字；其餘貼重整後的段落
-        if text and kind != "image_only":
-            for para in reflow_text(text):
-                doc.add_paragraph(para)
-        doc.add_page_break()
+        paras = reflow_text(text) if (text and kind != "image_only") else []
+        in_page_heading = False
+        for j, para in enumerate(paras):
+            heading = is_heading(para) or (
+                in_page_heading and len(para) <= 15 and not is_terminal(para)
+            )
+            # 跨頁接合：上頁未句末結束 → 併入下頁首段
+            if (
+                j == 0 and not page_has_img and not prev_has_img
+                and items and items[-1][0] in ("text", "heading")
+                and not prev_terminal and not heading
+            ):
+                items[-1] = (items[-1][0], items[-1][1] + para)
+            else:
+                items.append(("heading", para) if heading else ("text", para))
+            if heading:
+                in_page_heading = True
+        prev_terminal = (not paras) or is_terminal(paras[-1])
+        prev_has_img = page_has_img
+
+    for kind_, payload in items:
+        if kind_ == "img":
+            p = doc.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            p.add_run().add_picture(payload, width=Inches(4.5))
+        else:
+            p = doc.add_paragraph()
+            r = p.add_run(payload)
+            if kind_ == "heading":
+                r.bold = True
+                r.font.size = Pt(16)
+                r.font.name = "SimHei"
+                r._element.rPr.rFonts.set(qn("w:eastAsia"), "SimHei")
+                p.paragraph_format.first_line_indent = Pt(0)
+                p.paragraph_format.space_before = Pt(12)
+                p.paragraph_format.space_after = Pt(12)
     doc.save(out_path)
 
 
@@ -207,7 +279,8 @@ def main():
     parser.add_argument("--pages", default="", help="頁碼，如 1-5 或 1,3,5")
     parser.add_argument("--out", default=None, help="輸出 .docx 路徑")
     parser.add_argument("--model", default="gemini-3.1-flash-lite",
-                        choices=["gemini-3.6-flash", "gemini-2.5-pro"],
+                        choices=["gemini-3.6-flash", "gemini-3.1-flash-lite",
+                                 "gemini-2.5-pro"],
                         help="Gemini 模型")
     parser.add_argument("--skip-ocr", action="store_true", help="只要原圖")
     parser.add_argument("--dpi", type=int, default=200, help="抽圖解析度")
