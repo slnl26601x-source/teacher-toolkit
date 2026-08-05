@@ -16,7 +16,8 @@
 
 ## 工具清單
 （之後加新工具時會自動更新）
-- （尚無）
+- 座標獵人（`tools/coordinate-hunter/`）— 直角座標練習遊戲，純前端
+- pdf2txt（`tools/pdf2txt/`）— PDF 轉文字/Word（PyMuPDF + pdf2docx）
 
 ## 工作注意事項
 - 學生資料一律去識別化（只用座號 + 班級代號）
