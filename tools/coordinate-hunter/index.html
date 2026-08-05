@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>座標獵人</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #0a0a0a;
+    color: #f5f5f5;
+    font-family: "Microsoft JhengHei", "Noto Sans TC", sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    min-height: 100vh;
+    padding: 20px;
+  }
+  h1 {
+    font-size: 2rem;
+    margin-bottom: 8px;
+    color: #ff8c1a;
+    text-shadow: 0 0 12px rgba(255, 140, 26, 0.5);
+  }
+  .subtitle { margin-bottom: 20px; color: #888; font-size: 0.9rem; }
+  .hud {
+    display: flex;
+    gap: 24px;
+    margin-bottom: 20px;
+    font-size: 1.2rem;
+  }
+  .hud span b {
+    color: #ff8c1a;
+    font-size: 1.5rem;
+  }
+  .board {
+    display: grid;
+    grid-template-columns: repeat(11, 36px);
+    grid-template-rows: repeat(11, 36px);
+    gap: 2px;
+    background: #1a1a1a;
+    padding: 8px;
+    border-radius: 8px;
+    border: 2px solid #ff8c1a33;
+  }
+  .cell {
+    width: 36px;
+    height: 36px;
+    background: #141414;
+    border: 1px solid #333;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.7rem;
+    color: #777;
+    user-select: none;
+  }
+  .cell.axis { background: #1e1e1e; color: #999; }
+  .cell.origin { color: #ff8c1a; font-weight: bold; }
+  .cell.hit { background: #ff8c1a; color: #0a0a0a; font-weight: bold; box-shadow: 0 0 8px #ff8c1a; }
+  .cell.miss { background: #222; color: #555; }
+  .controls {
+    margin-top: 20px;
+    display: flex;
+    gap: 10px;
+    align-items: center;
+  }
+  input {
+    padding: 10px 14px;
+    font-size: 1.1rem;
+    background: #141414;
+    color: #fff;
+    border: 2px solid #333;
+    border-radius: 6px;
+    width: 160px;
+    text-align: center;
+  }
+  input:focus { outline: none; border-color: #ff8c1a; }
+  button {
+    padding: 10px 20px;
+    font-size: 1.1rem;
+    background: #ff8c1a;
+    color: #0a0a0a;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    font-weight: bold;
+  }
+  button:hover { background: #ffa03d; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  #message {
+    margin-top: 14px;
+    font-size: 1rem;
+    min-height: 1.4em;
+    color: #ff8c1a;
+  }
+  #result {
+    margin-top: 14px;
+    font-size: 1.6rem;
+    font-weight: bold;
+    color: #ff8c1a;
+  }
+</style>
+</head>
+<body>
+  <h1>座標獵人</h1>
+  <p class="subtitle">找出 10 個隱藏座標！輸入 xy 座標（例：2,-3）</p>
+
+  <div class="hud">
+    <span>得分 <b id="score">0</b></span>
+    <span>剩餘 <b id="time">60</b> 秒</span>
+  </div>
+
+  <div class="board" id="board"></div>
+
+  <div class="controls">
+    <input id="guess" placeholder="x,y 例：2,-3" autocomplete="off">
+    <button id="submitBtn">發射！</button>
+    <button id="restartBtn">重新開始</button>
+  </div>
+
+  <div id="message"></div>
+  <div id="result"></div>
+
+<script>
+const SIZE = 11;      // 11×11
+const HALF = 5;       // -5..5
+const TARGET_COUNT = 10;
+const TIME_LIMIT = 60;
+
+const boardEl = document.getElementById('board');
+const scoreEl = document.getElementById('score');
+const timeEl = document.getElementById('time');
+const guessEl = document.getElementById('guess');
+const submitBtn = document.getElementById('submitBtn');
+const restartBtn = document.getElementById('restartBtn');
+const messageEl = document.getElementById('message');
+const resultEl = document.getElementById('result');
+
+let targets = [];
+let hits = new Set();
+let misses = new Set();
+let score = 0;
+let timeLeft = TIME_LIMIT;
+let timer = null;
+let gameOver = false;
+
+function idx(x, y) { return (y + HALF) * SIZE + (x + HALF); }
+
+function newGame() {
+  targets = [];
+  hits = new Set();
+  misses = new Set();
+  score = 0;
+  timeLeft = TIME_LIMIT;
+  gameOver = false;
+  clearInterval(timer);
+
+  const pool = [];
+  for (let y = -HALF; y <= HALF; y++)
+    for (let x = -HALF; x <= HALF; x++)
+      pool.push([x, y]);
+  for (let i = pool.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [pool[i], pool[j]] = [pool[j], pool[i]];
+  }
+  targets = pool.slice(0, TARGET_COUNT);
+
+  scoreEl.textContent = '0';
+  timeEl.textContent = TIME_LIMIT;
+  messageEl.textContent = '';
+  resultEl.textContent = '';
+  guessEl.value = '';
+  guessEl.disabled = false;
+  submitBtn.disabled = false;
+
+  renderBoard();
+  timer = setInterval(() => {
+    timeLeft--;
+    timeEl.textContent = timeLeft;
+    if (timeLeft <= 0) endGame();
+  }, 1000);
+}
+
+function renderBoard() {
+  boardEl.innerHTML = '';
+  for (let y = HALF; y >= -HALF; y--) {
+    for (let x = -HALF; x <= HALF; x++) {
+      const cell = document.createElement('div');
+      cell.className = 'cell';
+      const i = idx(x, y);
+      if (hits.has(i)) {
+        cell.classList.add('hit');
+        cell.textContent = '★';
+      } else if (misses.has(i)) {
+        cell.classList.add('miss');
+        cell.textContent = '×';
+      } else if (x === 0 && y === 0) {
+        cell.classList.add('origin');
+        cell.textContent = '●';
+      } else if (x === 0) {
+        cell.classList.add('axis');
+        cell.textContent = y;
+      } else if (y === 0) {
+        cell.classList.add('axis');
+        cell.textContent = x;
+      }
+    }
+  }
+}
+
+function parseGuess(str) {
+  const m = str.trim().match(/^\s*(-?\d+)\s*,\s*(-?\d+)\s*$/);
+  if (!m) return null;
+  const x = parseInt(m[1], 10);
+  const y = parseInt(m[2], 10);
+  if (x < -HALF || x > HALF || y < -HALF || y > HALF) return null;
+  return [x, y];
+}
+
+function fire() {
+  if (gameOver) return;
+  const g = parseGuess(guessEl.value);
+  if (!g) {
+    messageEl.textContent = '格式錯誤！請輸入 x,y（例：2,-3）';
+    return;
+  }
+  const [x, y] = g;
+  const i = idx(x, y);
+  if (hits.has(i) || misses.has(i)) {
+    messageEl.textContent = '這裡已經打過了！';
+    return;
+  }
+  if (targets.some(([tx, ty]) => tx === x && ty === y)) {
+    hits.add(i);
+    score++;
+    scoreEl.textContent = score;
+    messageEl.textContent = `命中！(${x},${y}) 是寶藏！`;
+    if (score === TARGET_COUNT) endGame();
+  } else {
+    misses.add(i);
+    messageEl.textContent = `沒打到… (${x},${y}) 是空的`;
+  }
+  guessEl.value = '';
+  guessEl.focus();
+  renderBoard();
+}
+
+function endGame() {
+  gameOver = true;
+  clearInterval(timer);
+  guessEl.disabled = true;
+  submitBtn.disabled = true;
+  resultEl.textContent = score === TARGET_COUNT
+    ? `太厲害了！滿分 ${score}/${TARGET_COUNT} 🎉`
+    : `時間到！得分 ${score} / ${TARGET_COUNT} 分`;
+  renderBoard();
+}
+
+submitBtn.addEventListener('click', fire);
+guessEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') fire(); });
+restartBtn.addEventListener('click', newGame);
+
+newGame();
+</script>
+</body>
+</html>
