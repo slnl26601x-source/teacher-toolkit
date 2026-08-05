@@ -81,16 +81,46 @@ def ocr_page(img_path: Path, model: str):
         "- 若圖片是純插圖/照片/無文字 → type=image_only\n"
         "- 若圖片同時有文字與插圖/照片 → type=mixed\n"
         "text 欄位：用 OCR 完整提取圖片中的文字，嚴格保留原文語言（不翻譯），"
-        "維持標點、段落與閱讀順序（直排中文依由上至下、由右至左）。"
+        "維持標點、段落與閱讀順序（直排中文依由上至下、由右至左）。\n"
+        "文字整理要求：\n"
+        "1. 依照原書的段落分塊：不同段落之間用一個空行（\\n\\n）分隔。\n"
+        "2. 段落內部不要換行（把斷行接回同一段）。\n"
+        "3. 頁碼（頁面邊緣或底部的獨立數字）一律忽略，不要輸出。\n"
+        "4. 純數字行不要輸出。\n"
         "image_only 時 text 留空字串。\n"
         "只回傳 JSON，不要加任何其他內容或 markdown 標記。"
     )
     image = types.Part.from_bytes(
         data=img_path.read_bytes(), mime_type="image/png")
-    resp = client.models.generate_content(
-        model=model,
-        contents=[prompt, image],
-    )
+    import time
+
+    def _call():
+        return client.models.generate_content(
+            model=model,
+            contents=[prompt, image],
+        )
+
+    resp = None
+    last_wait = 0
+    for attempt in range(8):
+        try:
+            resp = _call()
+            break
+        except Exception as e:
+            msg = str(e)
+            wait = 0
+            if "429" in msg and "retryDelay" in msg:
+                import re as _re
+                m = _re.search(r"retryDelay': '(\d+)s", msg)
+                if m:
+                    wait = int(m.group(1))
+            wait = max(wait, last_wait * 2, 3)
+            last_wait = wait
+            print(f"    429 限流，等待 {wait} 秒後重試（{attempt + 1}/8）...",
+                  file=sys.stderr)
+            time.sleep(wait)
+    if resp is None:
+        raise RuntimeError("Gemini OCR 多次重試仍失敗（限流）")
     raw = resp.text.strip() if resp.text else ""
     try:
         data = json.loads(raw.strip("` \n").removeprefix("json"))
@@ -99,6 +129,39 @@ def ocr_page(img_path: Path, model: str):
     kind = data.get("type") if data.get("type") in (
         "text_only", "image_only", "mixed") else "mixed"
     return kind, (data.get("text") or "").strip()
+
+
+def reflow_text(text: str) -> list:
+    """重整 OCR 文字為段落清單：
+    - 移除孤行頁碼（如『8』，全行僅數字）
+    - 空行、行首縮排、或行首為對話引號（「『）視為新段落
+    - 其餘斷行直接接回同一段
+    """
+    import re
+
+    paras: list[str] = []
+    cur: list[str] = []
+    for ln in text.splitlines():
+        s = ln.strip()
+        if not s:
+            if cur:
+                paras.append("".join(cur))
+                cur = []
+            continue
+        if re.fullmatch(r"\d{1,4}", s):  # 孤行頁碼
+            continue
+        starts_new = (
+            s.startswith("　") or s.startswith("  ") or s.startswith("\t")
+            or s.startswith("“") or s.startswith("「") or s.startswith("『")
+        )
+        if cur and starts_new:
+            paras.append("".join(cur))
+            cur = [s]
+        else:
+            cur.append(s)
+    if cur:
+        paras.append("".join(cur))
+    return [p for p in paras if p.strip()]
 
 
 def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
@@ -130,9 +193,10 @@ def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
             p = doc.add_paragraph()
             p.add_run().add_picture(str(png), width=Inches(5.0))
 
-        # 純圖頁 → 不貼文字；其餘貼 OCR 文字（不加標籤）
+        # 純圖頁 → 不貼文字；其餘貼重整後的段落
         if text and kind != "image_only":
-            doc.add_paragraph(text)
+            for para in reflow_text(text):
+                doc.add_paragraph(para)
         doc.add_page_break()
     doc.save(out_path)
 
@@ -168,12 +232,14 @@ def main():
 
     if not args.skip_ocr:
         print("步驟 2/3：Gemini OCR 逐頁讀取 ...")
+        import time
         for i in idxs:
             png = pages_dir / f"page_{i + 1:03d}.png"
             txt = pages_dir / f"page_{i + 1:03d}.ocr.txt"
             if not txt.exists():
                 kind, text = ocr_page(png, args.model)
                 txt.write_text(f"{kind}\n{text}", encoding="utf-8")
+                time.sleep(4)  # 避免觸發每分鐘上限
             else:
                 kind = txt.read_text(encoding="utf-8").split("\n", 1)[0]
             print(f"  頁 {i + 1} ✓（{kind}）")
