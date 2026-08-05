@@ -146,6 +146,7 @@ def reflow_text(text: str) -> list:
 
     paras: list[str] = []
     cur: list[str] = []
+    prev_was_toc = False
     for ln in text.splitlines():
         s = ln.strip()
         if not s:
@@ -155,15 +156,18 @@ def reflow_text(text: str) -> list:
             continue
         if re.fullmatch(r"\d{1,4}", s):  # 孤行頁碼
             continue
+        toc_line = bool(re.match(r"^第[一二三四五六七八九十百千\d]+章\s*\S", s))
         starts_new = (
             s.startswith("　") or s.startswith("  ") or s.startswith("\t")
             or s.startswith("“") or s.startswith("「") or s.startswith("『")
+            or (toc_line and prev_was_toc)   # 目錄每章各成一行
         )
         if cur and starts_new:
             paras.append("".join(cur))
             cur = [s]
         else:
             cur.append(s)
+        prev_was_toc = toc_line
     if cur:
         paras.append("".join(cur))
     return [p for p in paras if p.strip()]
@@ -180,7 +184,7 @@ def is_heading(s: str) -> bool:
     if re.match(r"^\d+[\.、．]\s*\S", t):
         return True
     norm = re.sub(r"\s", "", t)
-    if norm in {"目录", "内容提要", "后记", "作者像", "序", "前言", "题记", "空中的足音"}:
+    if norm in {"目录", "内容提要", "后记", "作者像", "序", "前言", "题记"}:
         return True
     return False
 
@@ -196,6 +200,7 @@ def is_terminal(s: str) -> bool:
 
 def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
                skip_ocr: bool, dpi: int = 200):
+    import re
     from docx import Document
     from docx.shared import Inches, Pt
     from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -240,6 +245,11 @@ def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
             heading = is_heading(para) or (
                 in_page_heading and len(para) <= 15 and not is_terminal(para)
             )
+            # 章節標題頁（如「第一章」）→ 分頁 + 置中
+            if heading and re.match(r"^第[一二三四五六七八九十百千\d]+章\s*$", para):
+                items.append(("page_break", None))
+                items.append(("chapter_title", para))
+                continue
             # 跨頁接合：上頁未句末結束 → 併入下頁首段
             if (
                 j == 0 and not page_has_img and not prev_has_img
@@ -254,22 +264,62 @@ def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
         prev_terminal = (not paras) or is_terminal(paras[-1])
         prev_has_img = page_has_img
 
+    toc_mode = False   # 目前是否在目錄段落內
     for kind_, payload in items:
         if kind_ == "img":
             p = doc.add_paragraph()
             p.alignment = WD_ALIGN_PARAGRAPH.CENTER
             p.add_run().add_picture(payload, width=Inches(4.5))
-        else:
+            continue
+        if kind_ == "page_break":
+            doc.add_page_break()
+            continue
+        if kind_ == "chapter_title":
             p = doc.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
             r = p.add_run(payload)
-            if kind_ == "heading":
-                r.bold = True
-                r.font.size = Pt(16)
-                r.font.name = "SimHei"
-                r._element.rPr.rFonts.set(qn("w:eastAsia"), "SimHei")
+            r.bold = True
+            r.font.size = Pt(22)
+            r.font.name = "SimHei"
+            r._element.rPr.rFonts.set(qn("w:eastAsia"), "SimHei")
+            p.paragraph_format.first_line_indent = Pt(0)
+            p.paragraph_format.space_before = Pt(72)
+            p.paragraph_format.space_after = Pt(24)
+            continue
+
+        norm = re.sub(r"\s", "", payload)
+        if kind_ == "heading" and norm == "目录":
+            toc_mode = True
+            p = doc.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            r = p.add_run(payload)
+            r.bold = True
+            r.font.size = Pt(16)
+            r.font.name = "SimHei"
+            r._element.rPr.rFonts.set(qn("w:eastAsia"), "SimHei")
+            p.paragraph_format.first_line_indent = Pt(0)
+            p.paragraph_format.space_after = Pt(12)
+            continue
+
+        p = doc.add_paragraph()
+        r = p.add_run(payload)
+        in_toc_entry = (
+            toc_mode and bool(re.match(r"^第[一二三四五六七八九十百千\d]+章", payload))
+        )
+        if kind_ == "heading" and not in_toc_entry:
+            r.bold = True
+            r.font.size = Pt(16)
+            r.font.name = "SimHei"
+            r._element.rPr.rFonts.set(qn("w:eastAsia"), "SimHei")
+            p.paragraph_format.first_line_indent = Pt(0)
+            p.paragraph_format.space_before = Pt(12)
+            p.paragraph_format.space_after = Pt(12)
+            toc_mode = False
+        else:
+            if in_toc_entry:
+                # 目錄條目：獨立行、不縮排
                 p.paragraph_format.first_line_indent = Pt(0)
-                p.paragraph_format.space_before = Pt(12)
-                p.paragraph_format.space_after = Pt(12)
+                p.paragraph_format.left_indent = Pt(24)
     doc.save(out_path)
 
 
