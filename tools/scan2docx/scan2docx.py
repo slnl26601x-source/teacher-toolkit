@@ -1,0 +1,190 @@
+"""
+掃描書 PDF → 圖文並存的 Word（原圖 + Gemini OCR 文字）
+
+用法：
+  python scan2docx.py "掃描書.pdf"
+  python scan2docx.py "掃描書.pdf" --pages 1-5            # 只處理指定頁
+  python scan2docx.py "掃描書.pdf" --out "輸出.docx"       # 指定輸出檔名
+  python scan2docx.py "掃描書.pdf" --model gemini-3.1-flash-lite
+  python scan2docx.py "掃描書.pdf" --skip-ocr             # 只要原圖、不 OCR
+
+逐頁智能判斷（Gemini 回報頁面類型）：
+  - text_only（純文字頁）→ 不插圖，只留 OCR 文字
+  - image_only（純圖無字）→ 保留原圖，不貼文字
+  - mixed（圖文混合）→ 保留原圖 + OCR 文字
+
+流程：
+  1. 每頁抽成高解析 PNG
+  2. Gemini 分析頁面類型 + OCR（快取於 _scan2docx_*/pages/*.ocr.txt）
+  3. 組 Word：依類型決定插圖與文字
+
+前置：~/.gemini.env 內有 GEMINI_API_KEY；需連網。
+"""
+
+import sys
+import argparse
+from pathlib import Path
+
+sys.stdout.reconfigure(encoding="utf-8")
+sys.stderr.reconfigure(encoding="utf-8")
+
+
+def parse_pages(spec: str, total: int):
+    """解析 '1-5'、'3'、'1,3,5' 等頁碼規格，回傳 0-based 索引清單。"""
+    if not spec:
+        return list(range(total))
+    idxs = []
+    for part in spec.split(","):
+        part = part.strip()
+        if "-" in part:
+            a, b = part.split("-", 1)
+            a, b = int(a), int(b)
+            idxs.extend(range(a - 1, b))
+        else:
+            idxs.append(int(part) - 1)
+    return sorted({i for i in idxs if 0 <= i < total})
+
+
+def extract_pages(pdf_path: Path, out_dir: Path, idxs, dpi: int = 200):
+    import pymupdf
+    doc = pymupdf.open(pdf_path)
+    for i in idxs:
+        pix = doc[i].get_pixmap(dpi=dpi)
+        png = out_dir / f"page_{i + 1:03d}.png"
+        pix.save(png)
+    doc.close()
+
+
+def ocr_page(img_path: Path, model: str):
+    """回傳 (kind, text)。kind: text_only | image_only | mixed"""
+    import base64
+    import json
+    from google import genai
+    from google.genai import types
+
+    key = None
+    env = Path.home() / ".gemini.env"
+    if env.exists():
+        for line in env.read_text(encoding="utf-8").splitlines():
+            if line.strip().startswith("GEMINI_API_KEY="):
+                key = line.split("=", 1)[1].strip().strip('"').strip("'")
+    if not key:
+        print("錯誤：找不到 GEMINI_API_KEY（~/.gemini.env）", file=sys.stderr)
+        sys.exit(1)
+
+    client = genai.Client(api_key=key)
+    prompt = (
+        "你是專業的影像分析助手。請分析這張圖片並回傳 JSON，格式如下：\n"
+        '{"type": "text_only" 或 "image_only" 或 "mixed", "text": "..."}\n'
+        "判斷規則：\n"
+        "- 若圖片是純文字頁（幾乎只有文字）→ type=text_only\n"
+        "- 若圖片是純插圖/照片/無文字 → type=image_only\n"
+        "- 若圖片同時有文字與插圖/照片 → type=mixed\n"
+        "text 欄位：用 OCR 完整提取圖片中的文字，嚴格保留原文語言（不翻譯），"
+        "維持標點、段落與閱讀順序（直排中文依由上至下、由右至左）。"
+        "image_only 時 text 留空字串。\n"
+        "只回傳 JSON，不要加任何其他內容或 markdown 標記。"
+    )
+    image = types.Part.from_bytes(
+        data=img_path.read_bytes(), mime_type="image/png")
+    resp = client.models.generate_content(
+        model=model,
+        contents=[prompt, image],
+    )
+    raw = resp.text.strip() if resp.text else ""
+    try:
+        data = json.loads(raw.strip("` \n").removeprefix("json"))
+    except Exception:
+        data = {"type": "mixed", "text": raw}
+    kind = data.get("type") if data.get("type") in (
+        "text_only", "image_only", "mixed") else "mixed"
+    return kind, (data.get("text") or "").strip()
+
+
+def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
+               skip_ocr: bool, dpi: int = 200):
+    from docx import Document
+    from docx.shared import Inches
+
+    doc = Document()
+    for n, i in enumerate(idxs):
+        png = pages_dir / f"page_{i + 1:03d}.png"
+        if not png.exists():
+            continue
+        kind = "mixed"
+        text = ""
+        if not skip_ocr:
+            txt = pages_dir / f"page_{i + 1:03d}.ocr.txt"
+            if txt.exists():
+                try:
+                    kind, text = txt.read_text(encoding="utf-8").split("\n", 1)
+                except Exception:
+                    kind, text = "mixed", ""
+            else:
+                kind, text = ocr_page(png, model)
+                txt.write_text(f"{kind}\n{text}", encoding="utf-8")
+
+        # 純文字頁 → 不插圖
+        show_img = kind != "text_only"
+        if show_img:
+            p = doc.add_paragraph()
+            p.add_run().add_picture(str(png), width=Inches(5.0))
+
+        # 純圖頁 → 不貼文字；其餘貼 OCR 文字（不加標籤）
+        if text and kind != "image_only":
+            doc.add_paragraph(text)
+        doc.add_page_break()
+    doc.save(out_path)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="掃描書 → 圖文 Word")
+    parser.add_argument("pdf", help="掃描 PDF 路徑")
+    parser.add_argument("--pages", default="", help="頁碼，如 1-5 或 1,3,5")
+    parser.add_argument("--out", default=None, help="輸出 .docx 路徑")
+    parser.add_argument("--model", default="gemini-3.1-flash-lite",
+                        choices=["gemini-3.6-flash", "gemini-2.5-pro"],
+                        help="Gemini 模型")
+    parser.add_argument("--skip-ocr", action="store_true", help="只要原圖")
+    parser.add_argument("--dpi", type=int, default=200, help="抽圖解析度")
+    args = parser.parse_args()
+
+    pdf = Path(args.pdf)
+    if not pdf.exists():
+        print(f"錯誤：找不到 {pdf}", file=sys.stderr)
+        sys.exit(1)
+
+    import pymupdf
+    total = len(pymupdf.open(pdf))
+    idxs = parse_pages(args.pages, total)
+
+    work = pdf.parent / f"_scan2docx_{pdf.stem}"
+    pages_dir = work / "pages"
+    pages_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"共 {total} 頁，處理 {len(idxs)} 頁（{args.pages or '全部'}）")
+    print("步驟 1/3：抽取頁面圖 ...")
+    extract_pages(pdf, pages_dir, idxs, args.dpi)
+
+    if not args.skip_ocr:
+        print("步驟 2/3：Gemini OCR 逐頁讀取 ...")
+        for i in idxs:
+            png = pages_dir / f"page_{i + 1:03d}.png"
+            txt = pages_dir / f"page_{i + 1:03d}.ocr.txt"
+            if not txt.exists():
+                kind, text = ocr_page(png, args.model)
+                txt.write_text(f"{kind}\n{text}", encoding="utf-8")
+            else:
+                kind = txt.read_text(encoding="utf-8").split("\n", 1)[0]
+            print(f"  頁 {i + 1} ✓（{kind}）")
+    else:
+        print("步驟 2/3：跳過 OCR（--skip-ocr）")
+
+    out = Path(args.out) if args.out else pdf.parent / f"{pdf.stem}_scan.docx"
+    print(f"步驟 3/3：組 Word → {out}")
+    build_docx(pages_dir, out, idxs, args.model, args.skip_ocr, args.dpi)
+    print(f"完成：{out}")
+
+
+if __name__ == "__main__":
+    main()
