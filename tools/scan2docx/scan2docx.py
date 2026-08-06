@@ -136,11 +136,12 @@ def ocr_page(img_path: Path, model: str):
     return kind, (data.get("text") or "").strip()
 
 
-def reflow_text(text: str) -> list:
+def reflow_text(text: str, toc: bool = False) -> list:
     """重整 OCR 文字為段落清單：
     - 移除孤行頁碼（如『8』，全行僅數字）
     - 空行、行首縮排、或行首為對話引號（「『）視為新段落
     - 其餘斷行直接接回同一段
+    - toc=True（目錄頁）：每一行各自成一段，不整併
     """
     import re
 
@@ -155,6 +156,13 @@ def reflow_text(text: str) -> list:
                 cur = []
             continue
         if re.fullmatch(r"\d{1,4}", s):  # 孤行頁碼
+            continue
+        if toc:
+            # 目錄頁：每行各自成段（含章/節標題與頁碼行）
+            if cur:
+                paras.append("".join(cur))
+                cur = []
+            paras.append(s)
             continue
         toc_line = bool(re.match(r"^第[一二三四五六七八九十百千\d]+章\s*\S", s))
         starts_new = (
@@ -188,7 +196,7 @@ def is_heading(s: str) -> bool:
     if re.match(r"^\d+[\.、．]\s*\S", t):
         return True
     norm = re.sub(r"\s", "", t)
-    if norm in {"目录", "内容提要", "后记", "作者像", "序", "前言", "题记"}:
+    if norm in {"目录", "目次", "内容提要", "后记", "作者像", "序", "前言", "题记"}:
         return True
     return False
 
@@ -221,6 +229,8 @@ def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
     items = []          # ("text"|"heading", 文字) 或 ("img", 路徑)
     prev_terminal = True   # 上一頁最後一段是否句末結束
     prev_has_img = False
+    toc_region = False   # 是否在目錄區（逢「目次」頁進入，續頁沿用）
+    prev_toc_page = False
 
     for n, i in enumerate(idxs):
         png = pages_dir / f"page_{i + 1:03d}.png"
@@ -243,7 +253,23 @@ def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
         if page_has_img:
             items.append(("img", str(png)))
 
-        paras = reflow_text(text) if (text and kind != "image_only") else []
+        if "目次" in (text or ""):
+            toc_region = True            # 進入目錄區（續頁沿用）
+        elif toc_region and text:
+            # 目錄續頁：整頁皆為短行 → 仍在目錄；出現長句 → 結束
+            longest = max((len(l.strip()) for l in text.splitlines()), default=0)
+            if longest > 45:
+                toc_region = False
+        is_toc_page = toc_region
+        paras = (reflow_text(text, toc=is_toc_page)
+                 if (text and kind != "image_only") else [])
+        if is_toc_page:
+            prev_terminal = True   # 目錄頁結束不跨頁接合
+        if is_toc_page and not prev_toc_page:
+            items.append(("toc_start", None))
+        elif not is_toc_page and prev_toc_page:
+            items.append(("toc_end", None))
+        prev_toc_page = is_toc_page
         in_page_heading = False
         for j, para in enumerate(paras):
             heading = is_heading(para) or (
@@ -270,11 +296,17 @@ def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
                 items.append(("heading", para) if heading else ("text", para))
             if heading:
                 in_page_heading = True
-        prev_terminal = (not paras) or is_terminal(paras[-1])
+        prev_terminal = True if is_toc_page else ((not paras) or is_terminal(paras[-1]))
         prev_has_img = page_has_img
 
     toc_mode = False   # 目前是否在目錄段落內
     for kind_, payload in items:
+        if kind_ == "toc_start":
+            toc_mode = True
+            continue
+        if kind_ == "toc_end":
+            toc_mode = False
+            continue
         if kind_ == "img":
             p = doc.add_paragraph()
             p.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -297,7 +329,7 @@ def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
             continue
 
         norm = re.sub(r"\s", "", payload)
-        if kind_ == "heading" and norm == "目录":
+        if kind_ == "heading" and norm in ("目录", "目次"):
             toc_mode = True
             p = doc.add_paragraph()
             p.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -323,9 +355,15 @@ def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
             p.paragraph_format.first_line_indent = Pt(0)
             p.paragraph_format.space_before = Pt(12)
             p.paragraph_format.space_after = Pt(12)
-            toc_mode = False
+            if toc_mode:
+                # 目錄內的一般標題（如 推薦序/導言）一律當條目，不放大
+                r.bold = False
+                r.font.size = Pt(12)
+                r.font.name = "SimSun"
+                r._element.rPr.rFonts.set(qn("w:eastAsia"), "SimSun")
+                p.paragraph_format.space_before = Pt(0)
         else:
-            if in_toc_entry:
+            if toc_mode or in_toc_entry:
                 # 目錄條目：獨立行、不縮排
                 p.paragraph_format.first_line_indent = Pt(0)
                 p.paragraph_format.left_indent = Pt(24)
