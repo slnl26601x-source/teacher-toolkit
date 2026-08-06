@@ -91,10 +91,22 @@ def ocr_page(img_path: Path, model: str):
         "文字整理要求：\n"
         "1. 依照原書的段落分塊：不同段落之間用一個空行（\\n\\n）分隔。\n"
         "2. 段落內部不要換行（把斷行接回同一段）。\n"
-        "3. 頁面頂部/底部的獨立頁碼（純數字的孤行）忽略，不要輸出。\n"
-        "4. 若該頁是目錄/目次：條目後方或右側的頁碼數字「要保留」，"
+        "3. 段落輸出的先後順序：依閱讀順序排列——直排中文先由上至下讀完一欄，"
+        "再由右欄往左欄；若頁面另有獨立圖說或底部文字，放在最後。\n"
+        "4. 頁面頂部/底部的獨立頁碼（純數字的孤行）忽略，不要輸出。\n"
+        "5. 若該頁是目錄/目次：條目後方或右側的頁碼數字「要保留」，"
         "直接接在該條目同一行末尾（例如『第一章　認識自然　15』）。\n"
-        "5. 純數字行（孤行頁碼）不要輸出。\n"
+        "6. 純數字行（孤行頁碼）不要輸出。\n"
+        "7. 完整保留句子：若一句話在頁面上因圖片、留白或版面設計而被拆開、"
+        "中斷或散落多處，請依上下文把它們補齊、接合成完整的一句，"
+        "不要在中途截斷或重複。\n"
+        "8. 圖片下方的圖說（說明文字）：若是獨立的一小段短句（約 80 字以內），"
+        "請把它單獨一行、自成一段輸出，並在該段文字最前面加上『[圖說]』三個字（中括號），"
+        "例如『[圖說]月光……有如流蕩的水光藻影。』，不要與相鄰正文合併。\n"
+        "9. 若 type=mixed：每個段落開頭加上該段在頁面上的位置座標，格式為"
+        "『(x,y)』，x 是水平位置（0-100，越大越靠右）、y 是垂直位置（0-100，越大越靠下），"
+        "緊貼在段落文字最前面，例如『(62,35)月光……。』『(40,20)另一個笑說……。』。"
+        "若 type=text_only 則不要加座標。\n"
         "image_only 時 text 留空字串。\n"
         "只回傳 JSON，不要加任何其他內容或 markdown 標記。"
     )
@@ -212,6 +224,35 @@ def fullwidth_punct(s: str) -> str:
     return "".join(out)
 
 
+def reorder_mixed(text: str) -> str:
+    """依直排閱讀順序（先由右至左、次由上至下）重排 mixed 頁段落。
+
+    Gemini 會在 mixed 頁為每段標註 (x,y) 位置座標（0-100，x 越大越靠右、
+    y 越大越靠下）。依「x 降序、y 升序」排序即符合「先右到左、次上到下」。
+    無座標的段落（解析失敗）排在最後。
+    """
+    import re
+    if not text:
+        return text
+    blocks = [b for b in text.split("\n\n") if b.strip()]
+    items = []
+    for b in blocks:
+        m = re.match(r"\(\s*(\d+)\s*,\s*(\d+)\s*\)\s*(.*)", b, re.S)
+        if m:
+            items.append((int(m.group(1)), int(m.group(2)), m.group(3).strip()))
+        else:
+            items.append((None, None, b.strip()))
+    if not any(x is not None for x, _, _ in items):
+        return text
+
+    def key(it):
+        x, y, _ = it
+        return (-x, y) if x is not None else (9999, 0)
+
+    ordered = sorted(items, key=key)
+    return "\n\n".join(t for _, _, t in ordered)
+
+
 def reflow_text(text: str, toc: bool = False) -> list:
     """重整 OCR 文字為段落清單：
     - 移除孤行頁碼（如『8』，全行僅數字）
@@ -244,6 +285,7 @@ def reflow_text(text: str, toc: bool = False) -> list:
         starts_new = (
             s.startswith("　") or s.startswith("  ") or s.startswith("\t")
             or s.startswith("“") or s.startswith("「") or s.startswith("『")
+            or s.startswith("[圖說]")   # Gemini 標記的圖說段
             or bool(re.match(r"^[*＊●○■□・·]", s))   # 項次/註記標記分行
             or (toc_line and prev_was_toc)   # 目錄每章各成一行
         )
@@ -313,7 +355,7 @@ def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
                retry_max: int = 5):
     import re
     from docx import Document
-    from docx.shared import Inches, Pt
+    from docx.shared import Inches, Pt, RGBColor
     from docx.enum.text import WD_ALIGN_PARAGRAPH
     from docx.oxml.ns import qn
 
@@ -350,6 +392,9 @@ def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
             txt.write_text(f"{kind}\n{text}", encoding="utf-8")
         elif skip_ocr:
             continue   # 跳過 OCR 且無快取 → 略過該頁
+        if kind == "mixed" and (text or "").strip():
+            # 依直排閱讀順序（右→左、上→下）重排段落
+            text = reorder_mixed(text)
         if not skip_ocr:
             # 防呆：應有文字卻回傳空 → 先免費 RapidOCR，再限量強模型重試
             if kind in ("text_only", "mixed") and not (text or "").strip():
@@ -375,8 +420,11 @@ def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
                           file=sys.stderr)
 
         page_has_img = kind != "text_only"
+        page_img_pos = None
+        page_captions = []          # 本頁圖說，插到圖片正下方
         if page_has_img:
             items.append(("img", str(png)))
+            page_img_pos = len(items) - 1
 
         if "目次" in (text or ""):
             toc_region = True            # 進入目錄區（續頁沿用）
@@ -409,6 +457,10 @@ def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
                     or (in_page_heading and len(para) <= 15 and not is_terminal(para))
                 )
             )
+            # 圖說（Gemini 標記的 [圖說] 段）→ 單獨成段、不與下文接合、剝離前綴
+            caption = page_has_img and para.startswith("[圖說]")
+            if caption:
+                para = para[len("[圖說]"):].strip()
             # 章節標題頁（如「第一章」「第一篇」）→ 分頁 + 置中
             if heading and re.match(_CHAPTER_ONLY_RE, para):
                 items.append(("page_break", None))
@@ -419,17 +471,23 @@ def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
                         items[-1] = ("chapter_title", para + "  " + sub)
                         paras[j + 1] = ""   # 副標併入，避免重複輸出
                 continue
-            # 跨頁接合：上頁未句末結束 → 併入下頁首段
+            # 跨頁接合：上頁未句末結束 → 併入下頁首段（圖說不接合）
             if (
-                j == 0 and not page_has_img and not prev_has_img
+                j == 0 and not caption and not page_has_img and not prev_has_img
                 and items and items[-1][0] in ("text", "heading")
                 and not prev_terminal and not heading
             ):
                 items[-1] = (items[-1][0], items[-1][1] + para)
+            elif caption:
+                page_captions.append(("caption", para))   # 圖說暫存，稍後插到圖後
             else:
                 items.append(("heading", para) if heading else ("text", para))
             if heading:
                 in_page_heading = True
+        # 圖說緊貼圖片下方（圖說說明的是那張圖，與正文區隔）
+        if page_captions and page_img_pos is not None:
+            for k, cap in enumerate(page_captions):
+                items.insert(page_img_pos + 1 + k, cap)
         prev_terminal = True if (is_toc_page or single_short_page) else (
             (not paras) or is_terminal(paras[-1]))
         prev_has_img = page_has_img
@@ -446,6 +504,15 @@ def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
             p = doc.add_paragraph()
             p.alignment = WD_ALIGN_PARAGRAPH.CENTER
             p.add_run().add_picture(payload, width=Inches(4.5))
+            continue
+        if kind_ == "caption":
+            # 圖說：緊貼圖下方、前綴「圖說：」、淺灰色小字、不縮排
+            p = doc.add_paragraph()
+            r = p.add_run("圖說：" + payload)
+            r.font.size = Pt(10.5)
+            r.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
+            p.paragraph_format.first_line_indent = Pt(0)
+            p.paragraph_format.space_after = Pt(6)
             continue
         if kind_ == "page_break":
             doc.add_page_break()
