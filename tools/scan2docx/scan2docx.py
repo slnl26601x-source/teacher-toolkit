@@ -139,6 +139,29 @@ def ocr_page(img_path: Path, model: str):
     return kind, (data.get("text") or "").strip()
 
 
+_rapid_engine = None
+
+
+def rapidocr_text(png: Path) -> str:
+    """免費本機 OCR（RapidOCR，離線、無 API 額度）。失敗回傳空字串。"""
+    global _rapid_engine
+    try:
+        if _rapid_engine is None:
+            from rapidocr_onnxruntime import RapidOCR
+            _rapid_engine = RapidOCR()
+        result, _ = _rapid_engine(str(png))
+    except Exception:
+        return ""
+    if not result:
+        return ""
+    lines = []
+    for box, text, score in result:
+        t = (text or "").strip()
+        if t:
+            lines.append(t)
+    return "\n".join(lines)
+
+
 def reflow_text(text: str, toc: bool = False) -> list:
     """重整 OCR 文字為段落清單：
     - 移除孤行頁碼（如『8』，全行僅數字）
@@ -199,7 +222,9 @@ def is_heading(s: str) -> bool:
     if re.match(r"^\d+[\.、．]\s*\S", t):
         return True
     norm = re.sub(r"\s", "", t)
-    if norm in {"目录", "目次", "内容提要", "后记", "作者像", "序", "前言", "题记"}:
+    if norm in {"目录", "目次", "内容提要", "后记", "作者像", "序", "前言",
+                "题记", "推薦序", "推荐序", "導言", "导言", "自序", "譯序",
+                "譯後記", "跋"}:
         return True
     return False
 
@@ -214,7 +239,8 @@ def is_terminal(s: str) -> bool:
 
 
 def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
-               skip_ocr: bool, dpi: int = 200):
+               skip_ocr: bool, dpi: int = 200, retry_model: str = "gemini-3.6-flash",
+               retry_max: int = 5):
     import re
     from docx import Document
     from docx.shared import Inches, Pt
@@ -234,6 +260,8 @@ def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
     prev_has_img = False
     toc_region = False   # 是否在目錄區（逢「目次」頁進入，續頁沿用）
     prev_toc_page = False
+    retry_used = [0]     # 強模型重試次數計數
+    empty_pages = []     # 仍空白待補的頁碼
 
     for n, i in enumerate(idxs):
         png = pages_dir / f"page_{i + 1:03d}.png"
@@ -251,14 +279,28 @@ def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
             else:
                 kind, text = ocr_page(png, model)
                 txt.write_text(f"{kind}\n{text}", encoding="utf-8")
-            # 防呆：應有文字卻回傳空 → 用更強模型重試一次
+            # 防呆：應有文字卻回傳空 → 先免費 RapidOCR，再限量強模型重試
             if kind in ("text_only", "mixed") and not (text or "").strip():
-                print(f"    頁 {i + 1} 文字為空，改用 gemini-3.6-flash 重試 ...",
-                      file=sys.stderr)
-                kind2, text2 = ocr_page(png, "gemini-3.6-flash")
-                if text2.strip():
-                    kind, text = kind2, text2
+                rt = rapidocr_text(png)
+                if rt.strip():
+                    kind, text = "text_only", rt
                     txt.write_text(f"{kind}\n{text}", encoding="utf-8")
+                    print(f"    頁 {i + 1} 文字為空，已用 RapidOCR 補回 {len(rt)} 字元",
+                          file=sys.stderr)
+                elif retry_used[0] < retry_max:
+                    retry_used[0] += 1
+                    print(f"    頁 {i + 1} RapidOCR 也空，改用 {retry_model} 重試 "
+                          f"（{retry_used[0]}/{retry_max}）...", file=sys.stderr)
+                    kind2, text2 = ocr_page(png, retry_model)
+                    if text2.strip():
+                        kind, text = kind2, text2
+                        txt.write_text(f"{kind}\n{text}", encoding="utf-8")
+                    else:
+                        empty_pages.append(i + 1)
+                else:
+                    empty_pages.append(i + 1)
+                    print(f"    頁 {i + 1} 仍空白（強模型額度已用罄，記錄待補）",
+                          file=sys.stderr)
 
         page_has_img = kind != "text_only"
         if page_has_img:
@@ -282,9 +324,16 @@ def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
             items.append(("toc_end", None))
         prev_toc_page = is_toc_page
         in_page_heading = False
+        single_short_page = (
+            len(paras) == 1 and 0 < len(paras[0].strip()) <= 18
+            and not is_terminal(paras[0].strip())
+        )
         for j, para in enumerate(paras):
             heading = is_heading(para) or (
-                in_page_heading and len(para) <= 15 and not is_terminal(para)
+                not is_toc_page and (
+                    single_short_page
+                    or (in_page_heading and len(para) <= 15 and not is_terminal(para))
+                )
             )
             # 章節標題頁（如「第一章」「第一篇」）→ 分頁 + 置中
             if heading and re.match(_CHAPTER_ONLY_RE, para):
@@ -307,7 +356,8 @@ def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
                 items.append(("heading", para) if heading else ("text", para))
             if heading:
                 in_page_heading = True
-        prev_terminal = True if is_toc_page else ((not paras) or is_terminal(paras[-1]))
+        prev_terminal = True if (is_toc_page or single_short_page) else (
+            (not paras) or is_terminal(paras[-1]))
         prev_has_img = page_has_img
 
     toc_mode = False   # 目前是否在目錄段落內
@@ -355,9 +405,14 @@ def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
 
         p = doc.add_paragraph()
         r = p.add_run(payload)
-        in_toc_entry = (
-            toc_mode and bool(re.match(_CHAPTER_RE, payload))
+        toc_main = (
+            re.match(_CHAPTER_RE, payload)
+            or bool(re.match(r"^(推薦序|推荐序|導言|导言|自序|前言|後記|后记|題記|跋)", payload))
         )
+        toc_num = bool(re.match(r"^\d+\s*\S", payload)) or bool(
+            re.match(r"^[一二三四五六七八九十]+[、.．]", payload))
+        in_toc_entry = toc_mode and (toc_main or toc_num or bool(
+            re.match(_CHAPTER_RE, payload)))
         if kind_ == "heading" and not in_toc_entry:
             r.bold = True
             r.font.size = Pt(16)
@@ -367,18 +422,40 @@ def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
             p.paragraph_format.space_before = Pt(12)
             p.paragraph_format.space_after = Pt(12)
             if toc_mode:
-                # 目錄內的一般標題（如 推薦序/導言）一律當條目，不放大
-                r.bold = False
-                r.font.size = Pt(12)
-                r.font.name = "SimSun"
-                r._element.rPr.rFonts.set(qn("w:eastAsia"), "SimSun")
-                p.paragraph_format.space_before = Pt(0)
+                # 目錄內的標題（如 推薦序/導言）→ 當主層級條目
+                r.bold = True
+                r.font.size = Pt(14)
+                r.font.name = "SimHei"
+                r._element.rPr.rFonts.set(qn("w:eastAsia"), "SimHei")
+                p.paragraph_format.space_before = Pt(8)
+                p.paragraph_format.space_after = Pt(4)
+                p.paragraph_format.left_indent = Pt(0)
         else:
             if toc_mode or in_toc_entry:
-                # 目錄條目：獨立行、不縮排
+                # 目錄條目：獨立行，依層級分字型大小
                 p.paragraph_format.first_line_indent = Pt(0)
-                p.paragraph_format.left_indent = Pt(24)
+                if toc_main:
+                    r.bold = True
+                    r.font.size = Pt(14)
+                    r.font.name = "SimHei"
+                    r._element.rPr.rFonts.set(qn("w:eastAsia"), "SimHei")
+                    p.paragraph_format.left_indent = Pt(0)
+                    p.paragraph_format.space_before = Pt(8)
+                elif toc_num:
+                    r.bold = True
+                    r.font.size = Pt(12.5)
+                    r.font.name = "SimSun"
+                    r._element.rPr.rFonts.set(qn("w:eastAsia"), "SimSun")
+                    p.paragraph_format.left_indent = Pt(24)
+                else:
+                    r.font.size = Pt(12)
+                    r.font.name = "SimSun"
+                    r._element.rPr.rFonts.set(qn("w:eastAsia"), "SimSun")
+                    p.paragraph_format.left_indent = Pt(48)
     doc.save(out_path)
+    if empty_pages:
+        print(f"\n⚠ 以下頁面仍無文字（RapidOCR 與強模型均失敗），請手動補：{empty_pages}",
+              file=sys.stderr)
 
 
 def main():
@@ -392,6 +469,12 @@ def main():
                         help="Gemini 模型")
     parser.add_argument("--skip-ocr", action="store_true", help="只要原圖")
     parser.add_argument("--dpi", type=int, default=200, help="抽圖解析度")
+    parser.add_argument("--retry-model", default="gemini-3.6-flash",
+                        choices=["gemini-3.6-flash", "gemini-3.1-flash-lite",
+                                 "gemini-2.5-pro"],
+                        help="空文字時的強模型（預設 gemini-3.6-flash）")
+    parser.add_argument("--retry-max", type=int, default=5,
+                        help="強模型每日/每次上限次數（預設 5）")
     args = parser.parse_args()
 
     pdf = Path(args.pdf)
@@ -429,7 +512,8 @@ def main():
 
     out = Path(args.out) if args.out else pdf.parent / f"{pdf.stem}_scan.docx"
     print(f"步驟 3/3：組 Word → {out}")
-    build_docx(pages_dir, out, idxs, args.model, args.skip_ocr, args.dpi)
+    build_docx(pages_dir, out, idxs, args.model, args.skip_ocr, args.dpi,
+               args.retry_model, args.retry_max)
     print(f"完成：{out}")
 
 
