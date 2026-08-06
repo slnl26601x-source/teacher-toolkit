@@ -133,7 +133,27 @@ def ocr_page(img_path: Path, model: str):
     try:
         data = json.loads(raw.strip("` \n").removeprefix("json"))
     except Exception:
-        data = {"type": "mixed", "text": raw}
+        # JSON 解析失敗：寬鬆抽取 "type" 與 "text"，避免把整包 JSON 當文字存檔
+        import re as _re
+        tm = _re.search(r'"type"\s*:\s*"(\w+)"', raw)
+        kind2 = tm.group(1) if tm and tm.group(1) in (
+            "text_only", "image_only", "mixed") else "mixed"
+        text2 = ""
+        im = _re.search(r'"text"\s*:\s*"((?:[^"\\]|\\.)*)"', raw, _re.S)
+        if im:
+            try:
+                text2 = json.loads('"' + im.group(1) + '"')
+            except Exception:
+                text2 = im.group(1)
+        # 若內容含未跳脫引號導致截斷，改從整段 JSON 抓取直到最後一個結尾引號
+        if "}," not in text2 and text2 and not text2.rstrip().endswith(("。", "！", "？", "\"", "」", "』")):
+            m2 = _re.search(r'"text"\s*:\s*"(.+)"\s*\}?\s*$', raw, _re.S)
+            if m2:
+                try:
+                    text2 = json.loads('"' + m2.group(1) + '"')
+                except Exception:
+                    text2 = m2.group(1)
+        data = {"type": kind2, "text": text2}
     kind = data.get("type") if data.get("type") in (
         "text_only", "image_only", "mixed") else "mixed"
     return kind, (data.get("text") or "").strip()
@@ -162,6 +182,36 @@ def rapidocr_text(png: Path) -> str:
     return "\n".join(lines)
 
 
+_CJK_RE = r"[\u2e80-\u2fff\u3000-\u303f\u3400-\u4dbf\u4e00-\u9fff\uF900-\uFAFF\u3040-\u30ff\uFF01-\uFF60]"
+
+
+def fullwidth_punct(s: str) -> str:
+    """半形標點轉全形：相鄰為中文字（CJK）時轉換，位於英文詞內時保留。
+
+    - ( ) → （ ）   , → ，   . → 。   ? → ？   ! → ！
+    - : → ：   ; → ；   「『」等既為全形不變
+    - 英文單字內的 - " ' .（如 Nokus-Ele、"Buffalo Bill"、St.、People's）維持半形
+    """
+    import re
+    if not s or not re.search(r"[,()?!:;.']", s):
+        return s
+    full = {",": "，", "(": "（", ")": "）", "?": "？",
+            "!": "！", ":": "：", ";": "；", ".": "。"}
+    out = []
+    for i, ch in enumerate(s):
+        if ch not in full:
+            out.append(ch)
+            continue
+        left = s[i - 1] if i > 0 else ""
+        right = s[i + 1] if i + 1 < len(s) else ""
+        # 兩側皆非中文（英文/數字/空白/符號）→ 視為英文語境，保留半形
+        if not re.match(_CJK_RE, left) and not re.match(_CJK_RE, right):
+            out.append(ch)
+        else:
+            out.append(full[ch])
+    return "".join(out)
+
+
 def reflow_text(text: str, toc: bool = False) -> list:
     """重整 OCR 文字為段落清單：
     - 移除孤行頁碼（如『8』，全行僅數字）
@@ -175,7 +225,7 @@ def reflow_text(text: str, toc: bool = False) -> list:
     cur: list[str] = []
     prev_was_toc = False
     for ln in text.splitlines():
-        s = ln.strip()
+        s = fullwidth_punct(ln.strip())
         if not s:
             if cur:
                 paras.append("".join(cur))
@@ -194,6 +244,7 @@ def reflow_text(text: str, toc: bool = False) -> list:
         starts_new = (
             s.startswith("　") or s.startswith("  ") or s.startswith("\t")
             or s.startswith("“") or s.startswith("「") or s.startswith("『")
+            or bool(re.match(r"^[*＊●○■□・·]", s))   # 項次/註記標記分行
             or (toc_line and prev_was_toc)   # 目錄每章各成一行
         )
         if cur and starts_new:
@@ -205,6 +256,25 @@ def reflow_text(text: str, toc: bool = False) -> list:
     if cur:
         paras.append("".join(cur))
     return [p for p in paras if p.strip()]
+
+
+def _merge_symbol_paras(paras: list) -> list:
+    """將連續的單一符號段落（如 * * *、- - -）合併成一行，如『＊ ＊ ＊』"""
+    import re
+    out: list = []
+    buf: list = []
+    for p in paras:
+        t = p.strip()
+        if re.fullmatch(r"[*＊●○•·-]{1,3}", t) or re.fullmatch(r"[*＊●○•·-]", t):
+            buf.append(t)
+        else:
+            if buf:
+                out.append("  ".join(buf))
+                buf = []
+            out.append(p)
+    if buf:
+        out.append("  ".join(buf))
+    return out
 
 
 _CHAPTER_RE = r"^第[一二三四五六七八九十百千參貳\d]+[章篇編部]"
@@ -249,9 +319,9 @@ def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
 
     doc = Document()
     style = doc.styles["Normal"]
-    style.font.name = "SimSun"
+    style.font.name = "PMingLiU"
     style.font.size = Pt(12)
-    style._element.rPr.rFonts.set(qn("w:eastAsia"), "SimSun")
+    style._element.rPr.rFonts.set(qn("w:eastAsia"), "PMingLiU")
     style.paragraph_format.first_line_indent = Pt(24)
     style.paragraph_format.space_after = Pt(6)
 
@@ -269,16 +339,18 @@ def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
             continue
         kind = "mixed"
         text = ""
+        txt = pages_dir / f"page_{i + 1:03d}.ocr.txt"
+        if txt.exists():
+            try:
+                kind, text = txt.read_text(encoding="utf-8").split("\n", 1)
+            except Exception:
+                kind, text = "mixed", ""
+        elif not skip_ocr:
+            kind, text = ocr_page(png, model)
+            txt.write_text(f"{kind}\n{text}", encoding="utf-8")
+        elif skip_ocr:
+            continue   # 跳過 OCR 且無快取 → 略過該頁
         if not skip_ocr:
-            txt = pages_dir / f"page_{i + 1:03d}.ocr.txt"
-            if txt.exists():
-                try:
-                    kind, text = txt.read_text(encoding="utf-8").split("\n", 1)
-                except Exception:
-                    kind, text = "mixed", ""
-            else:
-                kind, text = ocr_page(png, model)
-                txt.write_text(f"{kind}\n{text}", encoding="utf-8")
             # 防呆：應有文字卻回傳空 → 先免費 RapidOCR，再限量強模型重試
             if kind in ("text_only", "mixed") and not (text or "").strip():
                 rt = rapidocr_text(png)
@@ -316,6 +388,8 @@ def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
         is_toc_page = toc_region
         paras = (reflow_text(text, toc=is_toc_page)
                  if (text and kind != "image_only") else [])
+        if not is_toc_page:
+            paras = _merge_symbol_paras(paras)
         if is_toc_page:
             prev_terminal = True   # 目錄頁結束不跨頁接合
         if is_toc_page and not prev_toc_page:
@@ -444,13 +518,13 @@ def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
                 elif toc_num:
                     r.bold = True
                     r.font.size = Pt(12.5)
-                    r.font.name = "SimSun"
-                    r._element.rPr.rFonts.set(qn("w:eastAsia"), "SimSun")
+                    r.font.name = "PMingLiU"
+                    r._element.rPr.rFonts.set(qn("w:eastAsia"), "PMingLiU")
                     p.paragraph_format.left_indent = Pt(24)
                 else:
                     r.font.size = Pt(12)
-                    r.font.name = "SimSun"
-                    r._element.rPr.rFonts.set(qn("w:eastAsia"), "SimSun")
+                    r.font.name = "PMingLiU"
+                    r._element.rPr.rFonts.set(qn("w:eastAsia"), "PMingLiU")
                     p.paragraph_format.left_indent = Pt(48)
     doc.save(out_path)
     if empty_pages:
