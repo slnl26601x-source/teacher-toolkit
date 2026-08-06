@@ -173,13 +173,17 @@ def reflow_text(text: str) -> list:
     return [p for p in paras if p.strip()]
 
 
+_CHAPTER_RE = r"^第[一二三四五六七八九十百千參貳\d]+[章篇編部]"
+_CHAPTER_ONLY_RE = r"^第[一二三四五六七八九十百千參貳\d]+[章篇編部]\s*$"
+
+
 def is_heading(s: str) -> bool:
     """判斷是否為標題（章/節/目錄等）"""
     import re
     t = s.strip()
     if not t:
         return False
-    if re.match(r"^第[一二三四五六七八九十百千\d]+章", t):
+    if re.match(_CHAPTER_RE, t):
         return True
     if re.match(r"^\d+[\.、．]\s*\S", t):
         return True
@@ -245,10 +249,15 @@ def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
             heading = is_heading(para) or (
                 in_page_heading and len(para) <= 15 and not is_terminal(para)
             )
-            # 章節標題頁（如「第一章」）→ 分頁 + 置中
-            if heading and re.match(r"^第[一二三四五六七八九十百千\d]+章\s*$", para):
+            # 章節標題頁（如「第一章」「第一篇」）→ 分頁 + 置中
+            if heading and re.match(_CHAPTER_ONLY_RE, para):
                 items.append(("page_break", None))
                 items.append(("chapter_title", para))
+                if j + 1 < len(paras):
+                    sub = paras[j + 1].strip()
+                    if 0 < len(sub) <= 18 and not is_terminal(sub):
+                        items[-1] = ("chapter_title", para + "  " + sub)
+                        paras[j + 1] = ""   # 副標併入，避免重複輸出
                 continue
             # 跨頁接合：上頁未句末結束 → 併入下頁首段
             if (
@@ -304,7 +313,7 @@ def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
         p = doc.add_paragraph()
         r = p.add_run(payload)
         in_toc_entry = (
-            toc_mode and bool(re.match(r"^第[一二三四五六七八九十百千\d]+章", payload))
+            toc_mode and bool(re.match(_CHAPTER_RE, payload))
         )
         if kind_ == "heading" and not in_toc_entry:
             r.bold = True
