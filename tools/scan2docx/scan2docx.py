@@ -81,17 +81,20 @@ def ocr_page(img_path: Path, model: str):
     prompt = (
         "你是專業的影像分析助手。請分析這張圖片並回傳 JSON，格式如下：\n"
         '{"type": "text_only" 或 "image_only" 或 "mixed", "text": "..."}\n'
-        "判斷規則：\n"
-        "- 若圖片是純文字頁（幾乎只有文字）→ type=text_only\n"
-        "- 若圖片是純插圖/照片/無文字 → type=image_only\n"
-        "- 若圖片同時有文字與插圖/照片 → type=mixed\n"
+        "判斷規則（type 影響是否輸出原圖，務必依『內容主體』判斷）：\n"
+        "- 頁面以文字為主（插圖/照片只是小範圍點綴或章首裝飾，正文仍佔大半）"
+        "→ type=text_only，此時會輸出全部文字、不保留整頁圖。\n"
+        "- 頁面幾乎只有插圖/照片、文字極少或只有圖說 → type=image_only。\n"
+        "- 頁面文字與插圖/照片都佔相當比例、彼此並列 → type=mixed。\n"
         "text 欄位：用 OCR 完整提取圖片中的文字，嚴格保留原文語言（不翻譯），"
         "維持標點、段落與閱讀順序（直排中文依由上至下、由右至左）。\n"
         "文字整理要求：\n"
         "1. 依照原書的段落分塊：不同段落之間用一個空行（\\n\\n）分隔。\n"
         "2. 段落內部不要換行（把斷行接回同一段）。\n"
-        "3. 頁碼（頁面邊緣或底部的獨立數字）一律忽略，不要輸出。\n"
-        "4. 純數字行不要輸出。\n"
+        "3. 頁面頂部/底部的獨立頁碼（純數字的孤行）忽略，不要輸出。\n"
+        "4. 若該頁是目錄/目次：條目後方或右側的頁碼數字「要保留」，"
+        "直接接在該條目同一行末尾（例如『第一章　認識自然　15』）。\n"
+        "5. 純數字行（孤行頁碼）不要輸出。\n"
         "image_only 時 text 留空字串。\n"
         "只回傳 JSON，不要加任何其他內容或 markdown 標記。"
     )
@@ -248,6 +251,14 @@ def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
             else:
                 kind, text = ocr_page(png, model)
                 txt.write_text(f"{kind}\n{text}", encoding="utf-8")
+            # 防呆：應有文字卻回傳空 → 用更強模型重試一次
+            if kind in ("text_only", "mixed") and not (text or "").strip():
+                print(f"    頁 {i + 1} 文字為空，改用 gemini-3.6-flash 重試 ...",
+                      file=sys.stderr)
+                kind2, text2 = ocr_page(png, "gemini-3.6-flash")
+                if text2.strip():
+                    kind, text = kind2, text2
+                    txt.write_text(f"{kind}\n{text}", encoding="utf-8")
 
         page_has_img = kind != "text_only"
         if page_has_img:
