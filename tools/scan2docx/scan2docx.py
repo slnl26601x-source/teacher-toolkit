@@ -67,57 +67,79 @@ def _gemini_page(img_path: Path, model: str, prompt: str):
     from google import genai
     from google.genai import types
 
-    key = None
+    keys = []
     env = Path.home() / ".gemini.env"
     if env.exists():
         for line in env.read_text(encoding="utf-8").splitlines():
-            if line.strip().startswith("GEMINI_API_KEY="):
-                key = line.split("=", 1)[1].strip().strip('"').strip("'")
-    if not key:
+            s = line.strip()
+            if s.startswith("GEMINI_API_KEY="):
+                keys.append(s.split("=", 1)[1].strip().strip('"').strip("'"))
+            elif s.startswith("GEMINI_API_KEY_B="):
+                # 備援 key：主 key 額度不足/429 時自動切換
+                keys.append(s.split("=", 1)[1].strip().strip('"').strip("'"))
+    if not keys:
         print("錯誤：找不到 GEMINI_API_KEY（~/.gemini.env）", file=sys.stderr)
         sys.exit(1)
 
-    client = genai.Client(api_key=key)
     image = types.Part.from_bytes(
         data=img_path.read_bytes(), mime_type="image/png")
     import time
 
-    def _call():
-        return client.models.generate_content(
-            model=model,
-            contents=[prompt, image],
-        )
-
     resp = None
     last_wait = 0
     consecutive_429 = 0
-    for attempt in range(15):
-        try:
-            resp = _call()
+    total_attempts = 0
+    for key in keys:
+        if len(keys) > 1:
+            tag = "主" if key == keys[0] else "備援"
+            print(f"    Gemini 用 {tag} key（{key[:8]}...）", file=sys.stderr)
+        client = genai.Client(api_key=key)
+        for attempt in range(15):
+            total_attempts += 1
+            try:
+                resp = client.models.generate_content(
+                    model=model,
+                    contents=[prompt, image],
+                )
+                break
+            except Exception as e:
+                msg = str(e)
+                wait = 3
+                if "429" in msg and "retryDelay" in msg:
+                    import re as _re
+                    m = _re.search(r"retryDelay': '(\d+)s", msg)
+                    if m:
+                        wait = int(m.group(1))
+                is_429 = "429" in msg
+                is_quota = any(k in msg for k in ("RESOURCE_EXHAUSTED", "quota",
+                                                  "limit", "denied access"))
+                if is_429:
+                    consecutive_429 += 1
+                else:
+                    consecutive_429 = 0
+                # 尊重 server 建議的 retryDelay，但封頂避免指數爆炸；連續 429 時才逐步放大
+                if consecutive_429 <= 1:
+                    wait = min(wait, 30)
+                else:
+                    wait = min(max(wait, 30), 90)
+                last_wait = wait
+                # 已用完主 key 的全部重試且還有備援 → 切換
+                if key == keys[0] and attempt == 14 and len(keys) > 1:
+                    print("    主 key 仍失敗，切換備援 key...", file=sys.stderr)
+                    break
+                if is_quota and key == keys[0] and len(keys) > 1:
+                    # 額度耗盡（403 denied / quota）：直接切換，不浪費重試
+                    print(f"    {tag} key 額度耗盡（{msg[:80]}）→ 切換備援 key...",
+                          file=sys.stderr)
+                    break
+                print(f"    429 限流/額度，等待 {wait} 秒後重試"
+                      f"（{total_attempts}/{15 * len(keys)}，{tag} key）...",
+                      file=sys.stderr)
+                time.sleep(wait)
+        if resp is not None:
             break
-        except Exception as e:
-            msg = str(e)
-            wait = 3
-            if "429" in msg and "retryDelay" in msg:
-                import re as _re
-                m = _re.search(r"retryDelay': '(\d+)s", msg)
-                if m:
-                    wait = int(m.group(1))
-            if "429" in msg:
-                consecutive_429 += 1
-            else:
-                consecutive_429 = 0
-            # 尊重 server 建議的 retryDelay，但封頂避免指數爆炸；連續 429 時才逐步放大
-            if consecutive_429 <= 1:
-                wait = min(wait, 30)
-            else:
-                wait = min(max(wait, 30), 90)
-            last_wait = wait
-            print(f"    429 限流，等待 {wait} 秒後重試（{attempt + 1}/15）...",
-                  file=sys.stderr)
-            time.sleep(wait)
     if resp is None:
-        raise RuntimeError("Gemini OCR 多次重試仍失敗（限流）")
+        raise RuntimeError("Gemini OCR 多次重試仍失敗（限流或額度耗盡）")
     raw = resp.text.strip() if resp.text else ""
     try:
         data = json.loads(raw.strip("` \n").removeprefix("json"))
@@ -237,8 +259,97 @@ _PROMPT_FMT = (
 _rapid_engine = None
 
 
+def _is_vertical_boxes(boxes) -> bool:
+    """判斷頁面是否為直排：多數文字框為『窄高』（直欄）。
+
+    RapidOCR 對直排書的每一欄回傳一個高窄框（w 小、h 大）；
+    橫排書則相反（寬框）。以此自動偵測並套用旋轉 OCR。
+    """
+    if not boxes or len(boxes) < 3:
+        return False
+    tall = 0
+    for box, _text, _score in boxes:
+        xs = [p[0] for p in box]
+        ys = [p[1] for p in box]
+        w = max(xs) - min(xs)
+        h = max(ys) - min(ys)
+        if h > 3 * w:
+            tall += 1
+    return tall >= max(3, int(len(boxes) * 0.5))
+
+
+def _rotate_and_ocr(png: Path):
+    """將頁面旋轉 90°（逆時針，直欄→橫行）後送 RapidOCR。
+
+    直排書欄序為右→左；旋轉後最右欄變成頂行，RapidOCR 依
+    上→下輸出＝正確的直排閱讀順序。回傳 (result, (W, H))，
+    其中 W、H 為旋轉後圖的寬高（座標以此歸一化）；失敗回傳
+    (None, None)。
+    """
+    global _rapid_engine
+    import tempfile
+    try:
+        from PIL import Image
+        if _rapid_engine is None:
+            from rapidocr_onnxruntime import RapidOCR
+            _rapid_engine = RapidOCR()
+        img = Image.open(png)
+        rot = img.rotate(90, expand=True)   # CCW
+        fd, tmp_name = tempfile.mkstemp(suffix=".png")
+        import os
+        os.close(fd)
+        tmp = Path(tmp_name)
+        try:
+            rot.save(tmp)
+            result, _ = _rapid_engine(str(tmp))
+        finally:
+            tmp.unlink(missing_ok=True)
+        return result, rot.size
+    except Exception:
+        return None, None
+
+
+def _order_vertical_lines(result, width):
+    """依 x 分欄、欄內依 y 排序、右欄優先（旋轉後座標適用）。
+
+    直排書旋轉成橫行後，RapidOCR 依 y 輸出會把左右欄交錯；
+    此函式以 x 間隙分欄、每欄由上而下，再以右欄→左欄串接，
+    還原直排閱讀順序。回傳排序後的 [(box, text, score)]。
+    """
+    items = []
+    for box, text, score in result:
+        xs = [p[0] for p in box]
+        ys = [p[1] for p in box]
+        cx = (min(xs) + max(xs)) / 2
+        cy = (min(ys) + max(ys)) / 2
+        items.append((cx, cy, box, text, score))
+    if len(items) < 2:
+        return result
+    items.sort(key=lambda t: t[0])
+    gap_thr = width * 0.06   # x 間隙大於 6% 頁寬視為欄界
+    cols = []
+    cur = [items[0]]
+    for it in items[1:]:
+        if it[0] - cur[-1][0] > gap_thr:
+            cols.append(cur)
+            cur = [it]
+        else:
+            cur.append(it)
+    cols.append(cur)
+    cols.sort(key=lambda c: -max(t[0] for t in c))   # 右欄優先
+    ordered = []
+    for c in cols:
+        c.sort(key=lambda t: t[1])   # 欄內由上到下
+        ordered.extend((box, text, score) for _cx, _cy, box, text, score in c)
+    return ordered
+
+
 def rapidocr_text(png: Path) -> str:
-    """免費本機 OCR（RapidOCR，離線、無 API 額度）。失敗回傳空字串。"""
+    """免費本機 OCR（RapidOCR，離線、無 API 額度）。失敗回傳空字串。
+
+    直排書自動旋轉：直欄轉橫行後再辨識，回傳文字依正確閱讀順序
+    （右→左、上→下）。
+    """
     global _rapid_engine
     try:
         if _rapid_engine is None:
@@ -249,6 +360,12 @@ def rapidocr_text(png: Path) -> str:
         return ""
     if not result:
         return ""
+    if _is_vertical_boxes(result):
+        rotated, rot_wh = _rotate_and_ocr(png)
+        if rotated:
+            result = rotated
+            if rot_wh:
+                result = _order_vertical_lines(result, rot_wh[0])
     lines = []
     for box, text, score in result:
         t = (text or "").strip()
@@ -290,9 +407,19 @@ def rapidocr_layout(png: Path):
         return None
     if not result:
         return None
+    rot_wh = None
+    vertical = False
+    if _is_vertical_boxes(result):
+        vertical = True
+        rotated, rot_wh = _rotate_and_ocr(png)
+        if rotated:
+            result = rotated
     W, H = png_size(png)
     if not W or not H:
         W, H = 1, 1
+    if rot_wh:
+        W, H = rot_wh  # 座標為旋轉後圖的座標
+        result = _order_vertical_lines(result, W)
     out = []
     for box, text, score in result:
         t = (text or "").strip()
@@ -311,7 +438,7 @@ def rapidocr_layout(png: Path):
             "w": round(w * 100 / W, 2),
             "h": round(h * 100 / H, 2),
         })
-    return {"W": W, "H": H, "lines": out}
+    return {"W": W, "H": H, "vertical": vertical, "lines": out}
 
 
 def analyze_title_lines(geo):
@@ -400,12 +527,42 @@ def page_header_title(layout):
     return None
 
 
-def is_key_page(i, geo, title_marks, manual_pages=None):
+def split_header_title(paras, hdr):
+    """若頁首孤立標題被 reflow 併入首段正文，拆出獨立標題段。
+
+    例如首段『怀孕的女生在妇产科医院等妻的时候…』且 hdr=『怀孕的女生』
+    → 拆成『怀孕的女生』＋『在妇产科医院等妻的时候…』。
+    段落若已帶格式標記（[標]/[粗]…）則不動（交給 fmt_mark 邏輯）。
+    回傳 (new_paras, 標題段索引 or None)。
+    """
+    import re
+    if not hdr or not paras:
+        return paras, None
+    hdr_norm = re.sub(r"\s", "", hdr)
+    if not hdr_norm:
+        return paras, None
+    for k, p in enumerate(paras):
+        if re.match(r"^\[[章標标粗中]\]", p):
+            continue
+        p_norm = re.sub(r"\s", "", p)
+        if p_norm == hdr_norm:
+            return paras, k
+        if p_norm.startswith(hdr_norm):
+            head = p[:len(hdr)]
+            rest = p[len(hdr):].strip()
+            new = list(paras)
+            new[k] = head
+            new.insert(k + 1, rest)
+            return new, k
+    return paras, None
+
+
+def is_key_page(i, geo, title_marks, manual_pages=None, prev_terminal=True):
     """是否為需要 Gemini 精準格式（粗體/版面）的關鍵頁。
     - 手動指定頁（--key-pages）
     - 全書前 3 頁（封面/版權/扉頁）
     - 含章節大標題（rank 2）的頁（章首頁）
-    - 頁首孤立短標題行（文章標題頁）
+    - 頁首孤立短標題行（文章標題頁；限前頁句末結束，續頁不算）
     回傳原因字串或 None。
     """
     if manual_pages and i in manual_pages:
@@ -414,7 +571,7 @@ def is_key_page(i, geo, title_marks, manual_pages=None):
         return "封面/前頁群"
     if any(m[1] == 2 for m in (title_marks or [])):
         return "章首大標題"
-    if page_header_title(geo):
+    if prev_terminal and page_header_title(geo):
         return "文章標題頁"
     return None
 
@@ -514,6 +671,14 @@ def reflow_text(text: str, toc: bool = False) -> list:
             paras.append(s)
             continue
         if re.fullmatch(r"\d{1,4}", s):  # 孤行頁碼
+            # 「PART 1」被拆成「PART / 1」→ 數字接回上一行（限 PART/第X部 後）
+            if cur:
+                joined = "".join(cur)
+                if (re.search(r"PART\s*$", joined, re.I)
+                        or re.match(r"^\[[章標标粗中]\]第[一二三四五六七八九十百千\d]+[部篇]",
+                                    joined)):
+                    cur.append(" " + s)
+                    continue
             continue
         toc_line = bool(re.match(r"^第[一二三四五六七八九十百千\d]+章\s*\S", s))
         starts_new = (
@@ -585,9 +750,170 @@ def is_terminal(s: str) -> bool:
     )
 
 
+def _fld_char(kind: str):
+    """回傳 w:fldChar 元素（begin / separate / end）"""
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    el = OxmlElement("w:fldChar")
+    el.set(qn("w:fldCharType"), kind)
+    return el
+
+
+def _instr_text(txt: str):
+    """回傳 w:instrText 元素（目錄欄位指令）"""
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    el = OxmlElement("w:instrText")
+    el.set(qn("xml:space"), "preserve")
+    el.text = txt
+    return el
+
+
+def _add_toc(doc):
+    """在文件開頭插入可更新的「目錄」欄位（Word 中 Ctrl+A → F9 更新）。"""
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.shared import Pt, RGBColor
+    from docx.oxml.ns import qn
+    p = doc.add_paragraph()
+    p.style = doc.styles["Heading 1"]
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    r = p.add_run("目錄")
+    r.bold = True
+    r.font.size = Pt(16)
+    r.font.name = "SimHei"
+    r._element.rPr.rFonts.set(qn("w:eastAsia"), "SimHei")
+    r.font.color.rgb = RGBColor(0, 0, 0)
+    p.paragraph_format.first_line_indent = Pt(0)
+    p.paragraph_format.space_after = Pt(12)
+    p2 = doc.add_paragraph()
+    p2.paragraph_format.first_line_indent = Pt(0)
+    r = p2.add_run()
+    r._element.append(_fld_char("begin"))
+    r = p2.add_run()
+    r._element.append(_instr_text(' TOC \\o "1-2" \\h \\z \\u '))
+    r = p2.add_run()
+    r._element.append(_fld_char("separate"))
+    r = p2.add_run("（在 Word 中按 Ctrl+A → F9 更新目錄）")
+    r.font.size = Pt(12)
+    r.font.name = "PMingLiU"
+    r._element.rPr.rFonts.set(qn("w:eastAsia"), "PMingLiU")
+    r = p2.add_run()
+    r._element.append(_fld_char("end"))
+    doc.add_page_break()
+
+
+def match_toc(text, entries, used):
+    """正文標題 vs 掃描目錄條目：回傳 (anchor, entry) 或 (None, None)。
+
+    以目錄文字為準：任一方向子字串/等值即視為同一篇（例：目錄「史上無情的背叛」
+    對上正文「史上最無情的背叛」）。不消耗（不寫入 used）。
+    """
+    import re
+    pn = re.sub(r"\s", "", text or "")
+    if len(pn) < 2:      # 太短（如拆行的「1」「P」）不當子字串比對
+        return None, None
+    for e in entries:
+        if e["anchor"] in used:
+            continue
+        tn = re.sub(r"\s", "", e["t"])
+        if len(tn) >= 2 and (pn == tn or pn in tn or tn in pn):
+            return e["anchor"], e
+    return None, None
+
+
+def _toc_numbered(line):
+    """目錄條目特徵：行尾帶 1-4 位頁碼（可含前導空格）。"""
+    import re
+    return bool(re.search(r"\d{1,4}\s*$", line.strip()))
+
+
+def _is_toc_like(text):
+    """無「目次」字樣時，以內容特徵判斷是否像目錄頁。
+
+    大部分行是短行（≤28 字），且有一定比例行尾帶頁碼 → 目錄。
+    """
+    import re
+    lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
+    if len(lines) < 5:
+        return False
+    short = sum(1 for l in lines if len(l) <= 28)
+    numbered = sum(1 for l in lines if _toc_numbered(l))
+    return (short / len(lines) >= 0.7) and numbered >= max(3, len(lines) // 3)
+
+
+def _scan_first_toc(paras, entries, used):
+    """回傳本頁第一個與目錄相符的條目（用於開場頁分頁判斷），不消耗。"""
+    import re
+    for para in paras:
+        p = para.strip()
+        if not p:
+            continue
+        p2 = re.sub(r"^\[[章標标粗中圖說]\]", "", p).strip()
+        pn = re.sub(r"\s", "", p2)
+        if len(pn) > 20:
+            continue
+        a, e = match_toc(p2, entries, used)
+        if a:
+            return e
+    return None
+
+
+def _parse_toc_para(para):
+    """解析掃描目錄頁的單行條目 → (層級, 標題, 頁碼 or None)。
+
+    層級：0=章節（PART/第X章） 1=文章 2=副標/無頁碼短行。
+    例：[標]最大的失敗，最好的收穫 014 → (1, '最大的失敗，最好的收穫', '014')
+        [章]都會過去               → (0, '都會過去', None)
+        [粗]挫折是包裝過的祝福       → (2, '挫折是包裝過的祝福', None)
+        「我從電視圈中學到的道理 156 161」→ 頁碼取最後一個（161）
+    """
+    import re
+    p = para.strip()
+    if not p:
+        return None
+    lvl = 2
+    m = re.match(r"\[([章標标粗中])\]", p)
+    if m:
+        mk = m.group(1)
+        p = p[3:].strip()
+        if mk == "章":
+            lvl = 0
+        elif mk in ("標", "标"):
+            lvl = 1
+    elif re.search(r"\d{1,4}\s*$", p):
+        lvl = 1          # 無標記但有尾端頁碼 → 文章條目
+    page = None
+    pm = re.search(r"(\d{1,4})(?:\s+\d{1,4})?\s*$", p)
+    if pm:
+        nums = re.findall(r"\d{1,4}", pm.group(0))
+        page = nums[-1] if nums else None
+        p = p[:pm.start()].strip()
+    if not p:
+        return None
+    return lvl, p, page
+
+
+def _add_bookmark(p, name):
+    """在段落開頭加入書籤（供目錄超連結跳轉）。"""
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    bid = str(abs(hash((id(p), name))) % (10 ** 12))
+    start = OxmlElement("w:bookmarkStart")
+    start.set(qn("w:id"), bid)
+    start.set(qn("w:name"), name)
+    end = OxmlElement("w:bookmarkEnd")
+    end.set(qn("w:id"), bid)
+    pPr = p._p.find(qn("w:pPr"))
+    if pPr is not None:
+        pPr.addnext(start)
+    else:
+        p._p.insert(0, start)
+    p._p.append(end)
+
+
 def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
                skip_ocr: bool, dpi: int = 200, retry_model: str = "gemini-3.6-flash",
-               retry_max: int = 5):
+               retry_max: int = 5, toc: bool = False):
     import re
     from docx import Document
     from docx.shared import Inches, Pt, RGBColor
@@ -602,6 +928,9 @@ def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
     style.paragraph_format.first_line_indent = Pt(24)
     style.paragraph_format.space_after = Pt(6)
 
+    if toc:
+        _add_toc(doc)
+
     items = []          # ("text"|"heading", 文字) 或 ("img", 路徑)
     prev_terminal = True   # 上一頁最後一段是否句末結束
     prev_has_img = False
@@ -609,6 +938,9 @@ def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
     prev_toc_page = False
     retry_used = [0]     # 強模型重試次數計數
     empty_pages = []     # 仍空白待補的頁碼
+    toc_entries = []     # 掃描目錄條目（作為正文標題對照基準）
+    used_anchors = set() # 已指派給正文標題的目錄錨點
+    prev_page_was_title = False  # 上一頁是否為開場頁（章節/文章標題頁）
 
     for n, i in enumerate(idxs):
         png = pages_dir / f"page_{i + 1:03d}.png"
@@ -627,8 +959,11 @@ def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
             txt.write_text(f"{kind}\n{text}", encoding="utf-8")
         elif skip_ocr:
             continue   # 跳過 OCR 且無快取 → 略過該頁
+        if n == 0:
+            kind = "mixed"   # 首頁＝封面：即使 OCR 歸為 text_only，也保留整頁圖
         # 幾何分析（RapidOCR 存的 .geo.json）→ 標題/置中判斷
         geo = pages_dir / f"page_{i + 1:03d}.geo.json"
+        layout = None
         title_marks = []
         if geo.exists():
             try:
@@ -637,6 +972,8 @@ def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
                 title_marks = analyze_title_lines(layout)
             except Exception:
                 title_marks = []
+        # 頁首孤立短標題行（文章標題頁；如「怀孕的女生」）
+        hdr = page_header_title(layout) if layout else None
         if kind == "mixed" and (text or "").strip():
             # 依直排閱讀順序（右→左、上→下）重排段落
             text = reorder_mixed(text)
@@ -664,39 +1001,13 @@ def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
                     print(f"    頁 {i + 1} 仍空白（強模型額度已用罄，記錄待補）",
                           file=sys.stderr)
 
-        page_has_img = kind != "text_only"
-        page_img_pos = None
-        page_captions = []          # 本頁圖說，插到圖片正下方
-        # 頁首孤立短標題 → 分頁（非首頁、且前頁句末結束＝新文章起頁）
-        if n > 0 and prev_terminal:
-            try:
-                hdr = page_header_title(layout) if geo.exists() and layout else None
-                if hdr:
-                    items.append(("page_break", None))
-            except Exception:
-                pass
-        if page_has_img:
-            items.append(("img", str(png)))
-            page_img_pos = len(items) - 1
-
-        def _is_toc_like(txt):
-            """內容特徵偵測目錄：多數短行＋多個頁碼（括號頁碼或獨立數字行）。"""
-            import re
-            lines = [l.strip() for l in txt.splitlines() if l.strip()]
-            if not lines:
-                return False
-            short = [l for l in lines if len(l) <= 40]
-            numbered = [l for l in lines
-                        if re.search(r"[（(]\s*\d+\s*[)）]$|^\d{1,3}$", l)]
-            short_ratio = len(short) / len(lines)
-            return (len(numbered) >= 5 and short_ratio >= 0.6)
-
+        # ── 目錄偵測 ─────────────────────────────────────────────
         if "目次" in (text or ""):
             toc_region = True            # 進入目錄區（續頁沿用）
         elif toc_region and text:
-            # 目錄續頁：整頁皆為短行 → 仍在目錄；出現長句 → 結束
+            # 目錄續頁：仍像目錄才沿用；出現長句或整頁已不具目錄特徵 → 結束
             longest = max((len(l.strip()) for l in text.splitlines()), default=0)
-            if longest > 45:
+            if longest > 45 or not _is_toc_like(text):
                 toc_region = False
         elif text and _is_toc_like(text):
             toc_region = True            # 無「目次」字樣，但內容特徵像目錄
@@ -705,19 +1016,94 @@ def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
                  if (text and kind != "image_only") else [])
         if not is_toc_page:
             paras = _merge_symbol_paras(paras)
-        if is_toc_page:
-            prev_terminal = True   # 目錄頁結束不跨頁接合
+        # 頁首孤立標題：與正文併段時拆出獨立標題（限前頁句末結束的新文章頁）
+        hdr_para = None
+        if hdr and prev_terminal and not is_toc_page:
+            paras, hdr_para = split_header_title(paras, hdr)
+
+        # ── 圖文混合頁與開場頁處理 ────────────────────────────────
+        page_has_img = kind != "text_only"
+        page_img_pos = None
+        page_captions = []          # 本頁圖說，插到圖片正下方
+        page_broken = False
+        if n > 0 and prev_terminal and hdr:
+            items.append(("page_break", None))
+            page_broken = True
+        # 頁級：以目錄對照偵測「章節/文章開場頁」→ 圖文混合頁在圖前先分頁
+        first_toc_entry = _scan_first_toc(paras, toc_entries, used_anchors)
+        if (page_has_img and first_toc_entry is not None and not page_broken
+                and n > 0 and (prev_terminal or prev_page_was_title)):
+            items.append(("page_break", None))
+            page_broken = True
+        if page_has_img:
+            items.append(("img", str(png)))
+            page_img_pos = len(items) - 1
+
+        # ── 目錄區段切換（分頁＋狀態標記） ─────────────────────────
         if is_toc_page and not prev_toc_page:
+            if n > 0:
+                items.append(("page_break", None))
             items.append(("toc_start", None))
         elif not is_toc_page and prev_toc_page:
             items.append(("toc_end", None))
         prev_toc_page = is_toc_page
+        # ── 目錄頁：條目解析（粗體＋書籤/超連結錨點） ───────────────
+        if is_toc_page:
+            for para in paras:
+                parsed = _parse_toc_para(para)
+                if not parsed:
+                    continue
+                lvl, title, page = parsed
+                subs = []
+                m = re.match(r"^(PART\s*\d+)\s+(.+)$", title)
+                if m:
+                    subs.append((lvl, m.group(1), page))
+                    subs.append((lvl, m.group(2), page))
+                else:
+                    subs.append((lvl, title, page))
+                for lv, tt, pg in subs:
+                    if not tt:
+                        continue
+                    anchor = f"_toc{len(toc_entries) + 1:04d}"
+                    toc_entries.append({"t": tt, "page": pg,
+                                        "anchor": anchor, "level": lv})
+                    items.append(("toc_entry", (tt, pg, anchor, lv)))
+            prev_terminal = True   # 目錄頁結束不跨頁接合
         in_page_heading = False
+        page_toc_sub = None   # 本頁標題配到的「TITLE——副標」目錄副標
         single_short_page = (
             len(paras) == 1 and 0 < len(paras[0].strip()) <= 18
             and not is_terminal(paras[0].strip())
         )
+        if is_toc_page:
+            pass   # 目錄條目已在上方直接輸出，不跑正文標題邏輯
         for j, para in enumerate(paras):
+            if is_toc_page:
+                continue
+            # 圖文混合頁：保留原圖＋OCR 文字貼近圖下（不做大標題）
+            if page_has_img:
+                cap_text = para
+                is_fig = False
+                m = re.match(r"\[([章標标粗中圖說])\]", cap_text)
+                if m:
+                    cap_text = cap_text[3:].strip()
+                    is_fig = m.group(1) in ("圖說", "图说")
+                if not cap_text:
+                    continue
+                a, e = match_toc(cap_text, toc_entries, used_anchors)
+                if e:
+                    # 以目錄文字為準：OCR 為目錄標題子字串 → 顯示目錄標題
+                    tn = re.sub(r"\s", "", e["t"])
+                    pn = re.sub(r"\s", "", cap_text)
+                    if tn and pn and pn in tn:
+                        cap_text = e["t"]
+                    if a:
+                        used_anchors.add(a)
+                if is_fig:
+                    page_captions.append(("caption", cap_text))
+                    continue
+                items.append(("mixed_caption", (cap_text, a)))
+                continue
             heading = is_heading(para) or (
                 not is_toc_page and (
                     single_short_page
@@ -735,6 +1121,9 @@ def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
                         break
                 if geo_rank:
                     heading = True
+            # 幾何大字標題證據（標題行 rank 或頁首孤立標題）→ 覆寫 Gemini 標記
+            geo_title = (geo_rank is not None) or (
+                hdr_para is not None and j == hdr_para)
             # Gemini 格式標記（關鍵頁）：[章]大標題 [標]標題 [粗]粗體 [中]置中
             # 相容半形/全形、繁簡體（標/标）
             fmt_mark = None
@@ -749,26 +1138,98 @@ def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
             if caption:
                 para = para[len("[圖說]"):].strip()
             # 章節標題頁（如「第一章」「第一篇」或幾何判為大標題）→ 分頁 + 置中
-            # [章] 不含章節結構關鍵字時降級為 [粗]（如「有这种女儿」是粗體非章標題）
+            # [章] 非章節結構關鍵字：
+            #   幾何大字證據 → 文章標題（16pt，如「有这种女儿」「左手·右手」）
+            #   續頁（前頁未句末結束）且無幾何證據 → 跨頁續句誤標，降為正文
             if fmt_mark == "[章]" and not re.match(_CHAPTER_ONLY_RE, para) \
                     and not re.search(r"序|前言|後記|跋|自序|推薦序|導言", para):
-                fmt_mark = "[粗]"
-                heading = False
-            # [標] 在續頁（前頁未句末結束）時降為正文（如「懷孕的女生」是續句非標題）
-            if fmt_mark in ("[標]", "[标]") and not prev_terminal:
-                fmt_mark = None
-                heading = False
+                if not prev_terminal and not geo_title:
+                    fmt_mark = None
+                    heading = False
+                else:
+                    fmt_mark = "[標]"
+                    heading = True
+            # [標] 判別：續頁/續句/短標籤 → 降級（避免把跨頁續句誤當標題）
+            if fmt_mark in ("[標]", "[标]"):
+                if not prev_terminal and not in_page_heading:
+                    # 前頁未句末結束＝續頁，如「懷孕的女生…」是續句非標題
+                    fmt_mark = None
+                    heading = False
+                elif re.search(r"[…·‧，、；;,.]+\s*$", para):
+                    # 以續句標點結尾（…，、；）＝跨頁未完句子
+                    fmt_mark = None
+                    heading = False
+                else:
+                    m_lab = re.match(r"^([^。！？]{1,15}[：:])\s*(.+)$", para, re.S)
+                    if m_lab:
+                        # 「老师的话：」短標籤 → 粗體標籤自成一段，其餘為正文
+                        items.append(("bold", m_lab.group(1)))
+                        para = m_lab.group(2).strip()
+                        fmt_mark = None
+                        heading = False
+                    elif re.search(r"[：:]\s*$", para) and len(para) <= 15:
+                        # 短標籤（如「老师的话：」）→ 粗體正文，非 16pt 標題
+                        fmt_mark = "[粗]"
+                        heading = False
+            # 幾何大字標題 → 蓋過 Gemini 粗體標記（書中文章標題一致為大字）
+            if geo_title and fmt_mark == "[粗]" and prev_terminal:
+                fmt_mark = "[標]"
+                heading = True
+            # 頁首孤立標題（geo 判斷，新文章起頁）→ 文章標題
+            if hdr_para is not None and j == hdr_para:
+                heading = True
+            # 「PART / 1」拆行成「PART 1」→ 純數字行併回前一個標題
+            if heading and re.fullmatch(r"\d{1,3}", para.strip()):
+                if items and items[-1][0] in ("heading", "chapter_title"):
+                    kk, pp = items[-1]
+                    if isinstance(pp, tuple):
+                        items[-1] = (kk, (pp[0] + " " + para.strip(), pp[1]))
+                    else:
+                        items[-1] = (kk, pp + " " + para.strip())
+                continue
+            # 副標以目錄為準：本頁標題已配到「TITLE——副標」目錄條目 →
+            # 緊接的短標題行視為副標欄位，改用目錄副標（避免 OCR 錯位副標
+            # 獨立成標題，或吃掉下一篇文章的錨點）
+            if page_toc_sub and in_page_heading and (
+                    fmt_mark in ("[章]", "[標]", "[标]")
+                    or (len(re.sub(r"\s", "", para)) <= 18
+                        and not is_terminal(para))):
+                items.append(("heading", (page_toc_sub, None)))
+                page_toc_sub = None
+                continue
+            # 目錄對照：正文標題與掃描目錄相符 → 文章/章節標題（分頁＋書籤）
+            toc_anchor = None
+            if not is_toc_page and toc_entries and (
+                    fmt_mark in ("[章]", "[標]", "[标]") or heading
+                    or (len(re.sub(r"\s", "", para)) <= 18
+                        and not is_terminal(para))):
+                a, e = match_toc(para, toc_entries, used_anchors)
+                if a:
+                    toc_anchor = a
+                    used_anchors.add(a)
+                    heading = True   # 目錄為準：補救 prev_terminal/geo 降級
+                    # 「TITLE——副標」條目 → 記下目錄副標，供副標欄位替換
+                    sub_m = re.split(r"[—–-]+", e["t"], maxsplit=1)
+                    if len(sub_m) == 2 and sub_m[1].strip():
+                        page_toc_sub = sub_m[1].strip()
+                    if not page_broken and n > 0:
+                        # 文章標題前必分頁（即使與上文尾巴同頁）
+                        items.append(("page_break", None))
+                        page_broken = True
             is_chapter = (heading and re.match(_CHAPTER_ONLY_RE, para)) or (
                 geo_rank == 2 or fmt_mark == "[章]"
             )
             if is_chapter:
-                items.append(("page_break", None))
-                items.append(("chapter_title", para))
+                if not page_broken:
+                    items.append(("page_break", None))
+                    page_broken = True
+                items.append(("chapter_title", (para, toc_anchor)))
                 if j + 1 < len(paras):
                     sub = paras[j + 1].strip()
                     if (0 < len(sub) <= 18 and not is_terminal(sub)
                             and not re.match(r"^\[[章標粗中圖說]\]", sub)):
-                        items[-1] = ("chapter_title", para + "  " + sub)
+                        items[-1] = ("chapter_title",
+                                     (para + "  " + sub, toc_anchor))
                         paras[j + 1] = ""   # 副標併入，避免重複輸出
                 continue
             # 跨頁接合：上頁未句末結束 → 併入下頁首段（圖說不接合）
@@ -777,7 +1238,11 @@ def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
                 and items and items[-1][0] in ("text", "heading")
                 and not prev_terminal and not heading
             ):
-                items[-1] = (items[-1][0], items[-1][1] + para)
+                kk, pp = items[-1]
+                if kk == "heading" and isinstance(pp, tuple):
+                    items[-1] = (kk, (pp[0] + para, pp[1]))
+                else:
+                    items[-1] = (kk, pp + para)
             elif caption:
                 page_captions.append(("caption", para))   # 圖說暫存，稍後插到圖後
             elif fmt_mark == "[粗]":
@@ -785,7 +1250,8 @@ def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
             elif fmt_mark == "[中]":
                 items.append(("center", para))            # 置中段
             else:
-                items.append(("heading", para) if heading else ("text", para))
+                items.append(("heading", (para, toc_anchor))
+                             if heading else ("text", para))
             if heading:
                 in_page_heading = True
         # 圖說緊貼圖片下方（圖說說明的是那張圖，與正文區隔）
@@ -795,8 +1261,17 @@ def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
         prev_terminal = True if (is_toc_page or single_short_page) else (
             (not paras) or is_terminal(paras[-1]))
         prev_has_img = page_has_img
+        prev_page_was_title = page_broken
+
+    # 已指派書籤的錨點（目錄超連結只連到有正文書籤者，避免斷連）
+    assigned_anchors = set()
+    for kind_, payload in items:
+        if kind_ in ("heading", "chapter_title", "mixed_caption") \
+                and isinstance(payload, tuple) and payload[1]:
+            assigned_anchors.add(payload[1])
 
     toc_mode = False   # 目前是否在目錄段落內
+    last_toc_anchor = None   # 最近的目錄錨點（未匹配條目連結後退用）
     for kind_, payload in items:
         if kind_ == "toc_start":
             toc_mode = True
@@ -818,20 +1293,40 @@ def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
             p.paragraph_format.first_line_indent = Pt(0)
             p.paragraph_format.space_after = Pt(6)
             continue
+        if kind_ == "mixed_caption":
+            # 圖文混合頁文字：貼近圖下、小字置中（不做大標題）
+            text, anchor = payload
+            p = doc.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            r = p.add_run(text)
+            r.font.size = Pt(11)
+            r.font.name = "PMingLiU"
+            r._element.rPr.rFonts.set(qn("w:eastAsia"), "PMingLiU")
+            p.paragraph_format.first_line_indent = Pt(0)
+            p.paragraph_format.space_before = Pt(4)
+            p.paragraph_format.space_after = Pt(6)
+            if anchor:
+                _add_bookmark(p, anchor)
+            continue
         if kind_ == "page_break":
             doc.add_page_break()
             continue
         if kind_ == "chapter_title":
+            text, anchor = payload
             p = doc.add_paragraph()
+            p.style = doc.styles["Heading 1"]
             p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            r = p.add_run(payload)
+            r = p.add_run(text)
             r.bold = True
             r.font.size = Pt(22)
             r.font.name = "SimHei"
             r._element.rPr.rFonts.set(qn("w:eastAsia"), "SimHei")
+            r.font.color.rgb = RGBColor(0, 0, 0)
             p.paragraph_format.first_line_indent = Pt(0)
             p.paragraph_format.space_before = Pt(72)
             p.paragraph_format.space_after = Pt(24)
+            if anchor:
+                _add_bookmark(p, anchor)
             continue
         if kind_ == "bold":
             # 粗體正文段（Gemini 標記 [粗]）→ 粗體、其餘同正文
@@ -846,21 +1341,75 @@ def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
             r = p.add_run(payload)
             p.paragraph_format.first_line_indent = Pt(0)
             continue
-
-        norm = re.sub(r"\s", "", payload)
-        if kind_ == "heading" and norm in ("目录", "目次"):
-            toc_mode = True
+        if kind_ == "toc_entry":
+            # 掃描目錄條目：粗體＋內部超連結連到正文標題書籤
+            text, page, anchor, lvl = payload
             p = doc.add_paragraph()
-            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            r = p.add_run(payload)
+            p.paragraph_format.first_line_indent = Pt(0)
+            p.paragraph_format.space_before = Pt(2)
+            p.paragraph_format.space_after = Pt(2)
+            if lvl == 0:
+                size, indent = Pt(13), Pt(0)
+            elif lvl == 1:
+                size, indent = Pt(12), Pt(24)
+            else:
+                size, indent = Pt(11), Pt(48)
+            p.paragraph_format.left_indent = indent
+            eff_anchor = anchor if anchor in assigned_anchors else last_toc_anchor
+            display = text + (f"　{page}" if page else "")
+            r = p.add_run(display)
+            r.bold = True
+            r.font.size = size
+            r.font.name = "PMingLiU"
+            r._element.rPr.rFonts.set(qn("w:eastAsia"), "PMingLiU")
+            if lvl == 0:
+                r.font.name = "SimHei"
+                r._element.rPr.rFonts.set(qn("w:eastAsia"), "SimHei")
+            if eff_anchor:
+                from docx.oxml import OxmlElement
+                hl = OxmlElement("w:hyperlink")
+                hl.set(qn("w:anchor"), eff_anchor)
+                hl.append(r._element)
+                p._p.append(hl)
+            if anchor in assigned_anchors:
+                last_toc_anchor = anchor
+            continue
+
+        if kind_ == "heading":
+            text, anchor = payload
+            norm = re.sub(r"\s", "", text)
+            if norm in ("目录", "目次"):
+                toc_mode = True
+                p = doc.add_paragraph()
+                p.style = doc.styles["Heading 1"]
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                r = p.add_run(text)
+                r.bold = True
+                r.font.size = Pt(16)
+                r.font.name = "SimHei"
+                r._element.rPr.rFonts.set(qn("w:eastAsia"), "SimHei")
+                r.font.color.rgb = RGBColor(0, 0, 0)
+                p.paragraph_format.first_line_indent = Pt(0)
+                p.paragraph_format.space_after = Pt(12)
+                if anchor:
+                    _add_bookmark(p, anchor)
+                continue
+            p = doc.add_paragraph()
+            p.style = doc.styles["Heading 2"]
+            r = p.add_run(text)
             r.bold = True
             r.font.size = Pt(16)
             r.font.name = "SimHei"
             r._element.rPr.rFonts.set(qn("w:eastAsia"), "SimHei")
+            r.font.color.rgb = RGBColor(0, 0, 0)
             p.paragraph_format.first_line_indent = Pt(0)
+            p.paragraph_format.space_before = Pt(12)
             p.paragraph_format.space_after = Pt(12)
+            if anchor:
+                _add_bookmark(p, anchor)
             continue
 
+        # 一般文字段（含舊式目錄段落相容）
         p = doc.add_paragraph()
         r = p.add_run(payload)
         toc_main = (
@@ -871,45 +1420,27 @@ def build_docx(pages_dir: Path, out_path: Path, idxs, model: str,
             re.match(r"^[一二三四五六七八九十]+[、.．]", payload))
         in_toc_entry = toc_mode and (toc_main or toc_num or bool(
             re.match(_CHAPTER_RE, payload)))
-        if kind_ == "heading" and not in_toc_entry:
-            r.bold = True
-            r.font.size = Pt(16)
-            r.font.name = "SimHei"
-            r._element.rPr.rFonts.set(qn("w:eastAsia"), "SimHei")
+        if in_toc_entry:
+            # 目錄條目（舊式相容）：獨立行，依層級分字型大小
             p.paragraph_format.first_line_indent = Pt(0)
-            p.paragraph_format.space_before = Pt(12)
-            p.paragraph_format.space_after = Pt(12)
-            if toc_mode:
-                # 目錄內的標題（如 推薦序/導言）→ 當主層級條目
+            if toc_main:
                 r.bold = True
                 r.font.size = Pt(14)
                 r.font.name = "SimHei"
                 r._element.rPr.rFonts.set(qn("w:eastAsia"), "SimHei")
-                p.paragraph_format.space_before = Pt(8)
-                p.paragraph_format.space_after = Pt(4)
                 p.paragraph_format.left_indent = Pt(0)
-        else:
-            if toc_mode or in_toc_entry:
-                # 目錄條目：獨立行，依層級分字型大小
-                p.paragraph_format.first_line_indent = Pt(0)
-                if toc_main:
-                    r.bold = True
-                    r.font.size = Pt(14)
-                    r.font.name = "SimHei"
-                    r._element.rPr.rFonts.set(qn("w:eastAsia"), "SimHei")
-                    p.paragraph_format.left_indent = Pt(0)
-                    p.paragraph_format.space_before = Pt(8)
-                elif toc_num:
-                    r.bold = True
-                    r.font.size = Pt(12.5)
-                    r.font.name = "PMingLiU"
-                    r._element.rPr.rFonts.set(qn("w:eastAsia"), "PMingLiU")
-                    p.paragraph_format.left_indent = Pt(24)
-                else:
-                    r.font.size = Pt(12)
-                    r.font.name = "PMingLiU"
-                    r._element.rPr.rFonts.set(qn("w:eastAsia"), "PMingLiU")
-                    p.paragraph_format.left_indent = Pt(48)
+                p.paragraph_format.space_before = Pt(8)
+            elif toc_num:
+                r.bold = True
+                r.font.size = Pt(12.5)
+                r.font.name = "PMingLiU"
+                r._element.rPr.rFonts.set(qn("w:eastAsia"), "PMingLiU")
+                p.paragraph_format.left_indent = Pt(24)
+            else:
+                r.font.size = Pt(12)
+                r.font.name = "PMingLiU"
+                r._element.rPr.rFonts.set(qn("w:eastAsia"), "PMingLiU")
+                p.paragraph_format.left_indent = Pt(48)
     doc.save(out_path)
     if empty_pages:
         print(f"\n⚠ 以下頁面仍無文字（RapidOCR 與強模型均失敗），請手動補：{empty_pages}",
@@ -937,8 +1468,12 @@ def main():
                         help="頁間等待秒數，避免觸發每分鐘上限（預設 4）")
     parser.add_argument("--no-gemini", action="store_true",
                         help="不使用 Gemini，全部用 RapidOCR（離線免費，無額度限制）")
+    parser.add_argument("--vertical-gemini-max", type=int, default=500,
+                        help="直排頁每日送 Gemini 上限（預設 500，超過退回 RapidOCR 旋轉版）")
     parser.add_argument("--key-pages", default="",
                         help="手動指定關鍵頁送 Gemini 精準格式（粗體/版面），如 1,3,5-7")
+    parser.add_argument("--toc", action="store_true",
+                        help="在文件開頭插入可更新的「目錄」欄位（Word 中按 F9 更新）")
     args = parser.parse_args()
 
     pdf = Path(args.pdf)
@@ -969,17 +1504,21 @@ def main():
                 png = pages_dir / f"page_{i + 1:03d}.png"
                 txt = pages_dir / f"page_{i + 1:03d}.ocr.txt"
                 geo = pages_dir / f"page_{i + 1:03d}.geo.json"
-                if not txt.exists():
+                # geo 缺失也重跑 RapidOCR 補寫（確保每頁都有幾何證據）
+                if not txt.exists() or not geo.exists():
                     layout = rapidocr_layout(png)
+                    if layout and not geo.exists():
+                        geo.write_text(
+                            __import__("json").dumps(layout, ensure_ascii=False),
+                            encoding="utf-8")
+                else:
+                    layout = None
+                if not txt.exists():
                     rt = "\n".join(clean_rapid_lines(
                         [l["t"] for l in layout["lines"]])) if layout else ""
                     kind = "text_only" if rt.strip() else "image_only"
                     text = rt if kind == "text_only" else ""
                     txt.write_text(f"{kind}\n{text}", encoding="utf-8")
-                    if layout:
-                        geo.write_text(
-                            __import__("json").dumps(layout, ensure_ascii=False),
-                            encoding="utf-8")
                     if (i + 1) % 50 == 0:
                         print(f"  已處理 {i + 1}/{len(idxs)} 頁", file=sys.stderr)
                 else:
@@ -991,19 +1530,44 @@ def main():
             gemini_used = 0
             rapid_used = 0
             key_pages = []
+            # 上一頁末段是否句末結束（決定本頁首行是否可能是新文章標題）
+            prev_terminal = True
+            if idxs and idxs[0] > 0:
+                p0 = pages_dir / f"page_{idxs[0]:03d}.ocr.txt"
+                if p0.exists():
+                    try:
+                        _, ptext = p0.read_text(encoding="utf-8").split("\n", 1)
+                        last = (ptext.strip().splitlines() or [""])[-1]
+                        prev_terminal = is_terminal(last) if last.strip() else True
+                    except Exception:
+                        prev_terminal = True
             for i in idxs:
                 png = pages_dir / f"page_{i + 1:03d}.png"
                 txt = pages_dir / f"page_{i + 1:03d}.ocr.txt"
                 geo = pages_dir / f"page_{i + 1:03d}.geo.json"
-                if not txt.exists():
+                # geo 缺失也重跑 RapidOCR 補寫（確保每頁都有幾何證據）
+                if not txt.exists() or not geo.exists():
                     # 1) RapidOCR 幾何分析（免費）
                     layout = rapidocr_layout(png)
+                    if layout and not geo.exists():
+                        geo.write_text(
+                            __import__("json").dumps(layout, ensure_ascii=False),
+                            encoding="utf-8")
+                else:
+                    layout = None
+                if not txt.exists():
                     rt = "\n".join(clean_rapid_lines(
                         [l["t"] for l in layout["lines"]])) if layout else ""
                     title_marks = analyze_title_lines(layout) if layout else []
-                    # 2) 關鍵頁（封面/目錄/章首）→ Gemini 精準格式 + 粗體
-                    reason = is_key_page(i, layout, title_marks, manual_pages) if layout else (
+                    # 2) 關鍵頁（封面/目錄/章首/文章標題頁）→ Gemini 精準格式 + 粗體
+                    reason = is_key_page(i, layout, title_marks, manual_pages,
+                                         prev_terminal) if layout else (
                         "無文字待 Gemini" if not rt else None)
+                    # 直排頁優先 Gemini：本機 RapidOCR 對直排書品質不佳，
+                    # 偵測到直排即以 Gemini 精準辨識（受每日上限保護）
+                    is_vertical = bool(layout and layout.get("vertical"))
+                    if is_vertical and gemini_used < args.vertical_gemini_max:
+                        reason = reason or "直排頁 Gemini 精準辨識"
                     if reason and rt.strip():
                         kind, text = ocr_page_formatted(png, args.model)
                         gemini_used += 1
@@ -1012,19 +1576,22 @@ def main():
                     elif rt.strip():
                         kind, text = "text_only", rt
                         rapid_used += 1
-                        if layout:
-                            geo.write_text(
-                                __import__("json").dumps(layout, ensure_ascii=False),
-                                encoding="utf-8")
                     else:
                         kind, text = ocr_page(png, args.model)
                         gemini_used += 1
                         time.sleep(args.delay)
                     txt.write_text(f"{kind}\n{text}", encoding="utf-8")
                 else:
-                    kind = txt.read_text(encoding="utf-8").split("\n", 1)[0]
+                    kind, text = txt.read_text(encoding="utf-8").split("\n", 1)
+                # 更新 prev_terminal：本頁最後非空行是否句末結束
+                if (text or "").strip():
+                    last = text.strip().splitlines()[-1]
+                    prev_terminal = is_terminal(last)
+                else:
+                    prev_terminal = True
                 print(f"  頁 {i + 1} ✓（{kind}）")
-            print(f"  Gemini 呼叫: {gemini_used} 次、RapidOCR: {rapid_used} 次")
+            print(f"  Gemini 呼叫: {gemini_used} 次（直排頁上限 {args.vertical_gemini_max}）、"
+                  f"RapidOCR: {rapid_used} 次")
             for pg, rsn in key_pages:
                 print(f"    - 頁 {pg} 送 Gemini（{rsn}）")
     else:
@@ -1033,7 +1600,7 @@ def main():
     out = Path(args.out) if args.out else pdf.parent / f"{pdf.stem}_scan.docx"
     print(f"步驟 3/3：組 Word → {out}")
     build_docx(pages_dir, out, idxs, args.model, args.skip_ocr, args.dpi,
-               args.retry_model, args.retry_max)
+               args.retry_model, args.retry_max, args.toc)
     print(f"完成：{out}")
 
 
